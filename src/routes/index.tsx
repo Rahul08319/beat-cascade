@@ -1,24 +1,26 @@
 import { createFileRoute } from "@tanstack/react-router";
+import PixelPulseRush from "@/components/PixelPulseRush";
 
-// No head() here: the home route inherits title/description/og/twitter from
-// __root.tsx, and ships no og:image so serve-time hosting can inject the
-// project's social preview (explicit og:image or latest screenshot).
 export const Route = createFileRoute("/")({
+  head: () => ({
+    meta: [
+      { title: "Pixel Pulse Rush — Neon Chiptune Rhythm Game" },
+      {
+        name: "description",
+        content:
+          "Tap to the beat as neon pixel blocks cascade in sync with a procedurally generated chiptune. Every run is unique.",
+      },
+      { property: "og:title", content: "Pixel Pulse Rush" },
+      {
+        property: "og:description",
+        content:
+          "A neon 8-bit rhythm rush. Tap the lanes, build combos, share your score.",
+      },
+    ],
+  }),
   component: Index,
 });
 
-// IMPORTANT: Replace this placeholder. See ./README.md for routing conventions.
 function Index() {
-  return (
-    <div
-      className="flex min-h-screen items-center justify-center"
-      style={{ backgroundColor: "#fcfbf8" }}
-    >
-      <img
-        data-lovable-blank-page-placeholder="REMOVE_THIS"
-        src="https://cdn.gpteng.co/blank-app-v1.svg"
-        alt="Your app will live here!"
-      />
-    </div>
-  );
+  return <PixelPulseRush />;
 }
