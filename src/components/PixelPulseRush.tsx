@@ -18,7 +18,7 @@ type DifficultyConfig = {
   label: string;
   bpm: number;
   bpmJitter: number;
-  density: number; // 0..1+ chance multiplier
+  density: number;
   hitWindow: number;
   perfectWindow: number;
   blurb: string;
@@ -54,6 +54,58 @@ const DIFFICULTIES: Record<Difficulty, DifficultyConfig> = {
   },
 };
 
+// ---------- Persistence ----------
+const STATS_KEY = "ppr:stats:v1";
+const OFFSET_KEY = "ppr:offset:v1";
+
+type DiffStats = {
+  bestScore: number;
+  bestCombo: number;
+  bestAccuracy: number;
+  plays: number;
+};
+type AllStats = Record<Difficulty, DiffStats>;
+const EMPTY_STATS: AllStats = {
+  easy: { bestScore: 0, bestCombo: 0, bestAccuracy: 0, plays: 0 },
+  normal: { bestScore: 0, bestCombo: 0, bestAccuracy: 0, plays: 0 },
+  hard: { bestScore: 0, bestCombo: 0, bestAccuracy: 0, plays: 0 },
+};
+
+function loadStats(): AllStats {
+  if (typeof window === "undefined") return EMPTY_STATS;
+  try {
+    const raw = localStorage.getItem(STATS_KEY);
+    if (!raw) return EMPTY_STATS;
+    const parsed = JSON.parse(raw);
+    return { ...EMPTY_STATS, ...parsed };
+  } catch {
+    return EMPTY_STATS;
+  }
+}
+function saveStats(s: AllStats) {
+  try {
+    localStorage.setItem(STATS_KEY, JSON.stringify(s));
+  } catch {
+    /* ignore */
+  }
+}
+function loadOffset(): number {
+  if (typeof window === "undefined") return 0;
+  try {
+    const v = localStorage.getItem(OFFSET_KEY);
+    return v ? Number(v) || 0 : 0;
+  } catch {
+    return 0;
+  }
+}
+function saveOffset(v: number) {
+  try {
+    localStorage.setItem(OFFSET_KEY, String(v));
+  } catch {
+    /* ignore */
+  }
+}
+
 type Note = {
   id: number;
   lane: number;
@@ -66,7 +118,19 @@ type Note = {
 
 type Judgement = { text: string; color: string; at: number };
 
-type GameState = "idle" | "playing" | "over";
+type GameState = "idle" | "playing" | "paused" | "over" | "calibrating";
+
+type FinalStats = {
+  score: number;
+  bestCombo: number;
+  accuracy: number;
+  hits: number;
+  total: number;
+  difficulty: Difficulty;
+  bpm: number;
+  newBestScore: boolean;
+  newBestCombo: boolean;
+};
 
 // ---------- Procedural chiptune ----------
 const SCALE = [0, 2, 3, 5, 7, 8, 10, 12];
@@ -75,6 +139,8 @@ const ROOT_MIDI = 45;
 function midiToFreq(midi: number) {
   return 440 * Math.pow(2, (midi - 69) / 12);
 }
+
+type ScheduleCb = (beat: number, hitTime: number, lanes: number[]) => void;
 
 class ChiptuneEngine {
   ctx: AudioContext;
@@ -88,6 +154,7 @@ class ChiptuneEngine {
   nextBeat = 0;
   beatIndex = 0;
   seed: number;
+  scheduleCb: ScheduleCb | null = null;
 
   constructor(bpm: number, density: number) {
     const Ctor: typeof AudioContext =
@@ -192,24 +259,20 @@ class ChiptuneEngine {
     const lanes: number[] = [];
     const posInBar = beat % 16;
     const d = this.density;
-    // Downbeats: always on normal/hard, mostly on easy
     if (posInBar % 4 === 0) {
       if (d >= 1 || this.rand(beat * 7.3 + 11) < 0.85) {
         lanes.push(Math.floor(this.rand(beat * 2 + 5) * LANES));
       }
     }
-    // Off-beat eighths
     const offBeatChance = 0.65 * d;
     if (posInBar % 2 === 1 && this.rand(beat * 1.7) < offBeatChance) {
       lanes.push(Math.floor(this.rand(beat * 4.1 + 3) * LANES));
     }
-    // Sixteenth flourish
     const sixteenthChance = 0.15 * d;
     if (this.rand(beat * 0.53) < sixteenthChance) {
       const l = Math.floor(this.rand(beat * 5.9) * LANES);
       if (!lanes.includes(l)) lanes.push(l);
     }
-    // Occasional chord (2 lanes) on hard
     if (d > 1.2 && posInBar % 8 === 0 && this.rand(beat * 9.1) < 0.4) {
       const l = Math.floor(this.rand(beat * 11.3) * LANES);
       if (!lanes.includes(l)) lanes.push(l);
@@ -217,12 +280,7 @@ class ChiptuneEngine {
     return lanes;
   }
 
-  start(scheduleAhead: (beat: number, hitTime: number, lanes: number[]) => void) {
-    this.running = true;
-    this.startTime = this.ctx.currentTime + 0.2;
-    this.nextBeat = 0;
-    this.beatIndex = 0;
-
+  runLoop() {
     const loop = () => {
       if (!this.running) return;
       const now = this.ctx.currentTime;
@@ -230,12 +288,40 @@ class ChiptuneEngine {
         const when = this.startTime + this.nextBeat * this.beatDur;
         this.scheduleBeat(this.nextBeat, when);
         const lanes = this.patternForBeat(this.nextBeat);
-        scheduleAhead(this.nextBeat, when, lanes);
+        this.scheduleCb?.(this.nextBeat, when, lanes);
         this.nextBeat++;
       }
       requestAnimationFrame(loop);
     };
     loop();
+  }
+
+  start(scheduleAhead: ScheduleCb) {
+    this.scheduleCb = scheduleAhead;
+    this.running = true;
+    this.startTime = this.ctx.currentTime + 0.2;
+    this.nextBeat = 0;
+    this.beatIndex = 0;
+    this.runLoop();
+  }
+
+  pause() {
+    this.running = false;
+    try {
+      this.ctx.suspend();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async unpause() {
+    try {
+      if (this.ctx.state !== "running") await this.ctx.resume();
+    } catch {
+      /* ignore */
+    }
+    this.running = true;
+    this.runLoop();
   }
 
   stop() {
@@ -248,6 +334,13 @@ class ChiptuneEngine {
     } catch {
       /* ignore */
     }
+    setTimeout(() => {
+      try {
+        this.ctx.close();
+      } catch {
+        /* ignore */
+      }
+    }, 400);
   }
 
   async resume() {
@@ -271,46 +364,102 @@ export default function PixelPulseRush() {
   const laneFlashRef = useRef<number[]>([0, 0, 0, 0]);
   const hitWindowRef = useRef(DIFFICULTIES.normal.hitWindow);
   const perfectWindowRef = useRef(DIFFICULTIES.normal.perfectWindow);
+  const latencyOffsetRef = useRef(0);
 
   const [difficulty, setDifficulty] = useState<Difficulty>("normal");
   const [state, setState] = useState<GameState>("idle");
   const [hud, setHud] = useState({ score: 0, combo: 0, misses: 0, best: 0 });
-  const [finalStats, setFinalStats] = useState<{
-    score: number;
-    bestCombo: number;
-    accuracy: number;
-    hits: number;
-    total: number;
-    difficulty: Difficulty;
-    bpm: number;
-  } | null>(null);
+  const [finalStats, setFinalStats] = useState<FinalStats | null>(null);
+  const [statsAll, setStatsAll] = useState<AllStats>(EMPTY_STATS);
+  const [latencyOffset, setLatencyOffset] = useState<number>(0);
+  const [shareUrl, setShareUrl] = useState<string>("");
+  const [challenge, setChallenge] = useState<
+    | null
+    | { score: number; combo: number; acc: number; diff: Difficulty }
+  >(null);
 
   const hitsRef = useRef(0);
   const totalRef = useRef(0);
-
   const activeTouchesRef = useRef<Map<number, number>>(new Map());
 
+  // Load persisted stats + offset + parse challenge URL
+  useEffect(() => {
+    setStatsAll(loadStats());
+    const off = loadOffset();
+    latencyOffsetRef.current = off;
+    setLatencyOffset(off);
+    try {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has("s")) {
+        const d = params.get("d");
+        const diff: Difficulty =
+          d === "easy" || d === "normal" || d === "hard" ? d : "normal";
+        setChallenge({
+          score: Number(params.get("s")) || 0,
+          combo: Number(params.get("c")) || 0,
+          acc: Number(params.get("a")) || 0,
+          diff,
+        });
+        setDifficulty(diff);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const endGame = useCallback(() => {
-    if (stateRef.current !== "playing") return;
+    if (stateRef.current !== "playing" && stateRef.current !== "paused") return;
     stateRef.current = "over";
     setState("over");
     const engine = engineRef.current;
     engine?.stop();
     const total = totalRef.current || 1;
-    setFinalStats({
+    const accuracy = Math.round((hitsRef.current / total) * 100);
+
+    const prev = statsAll[difficulty];
+    const newBestScore = scoreRef.current > prev.bestScore;
+    const newBestCombo = bestComboRef.current > prev.bestCombo;
+
+    const stats: FinalStats = {
       score: scoreRef.current,
       bestCombo: bestComboRef.current,
-      accuracy: Math.round((hitsRef.current / total) * 100),
+      accuracy,
       hits: hitsRef.current,
       total: totalRef.current,
       difficulty,
       bpm: engine?.bpm ?? DIFFICULTIES[difficulty].bpm,
-    });
-  }, [difficulty]);
+      newBestScore,
+      newBestCombo,
+    };
+    setFinalStats(stats);
+
+    const next: AllStats = {
+      ...statsAll,
+      [difficulty]: {
+        bestScore: Math.max(prev.bestScore, stats.score),
+        bestCombo: Math.max(prev.bestCombo, stats.bestCombo),
+        bestAccuracy: Math.max(prev.bestAccuracy, accuracy),
+        plays: prev.plays + 1,
+      },
+    };
+    setStatsAll(next);
+    saveStats(next);
+
+    try {
+      const u = new URL(window.location.href);
+      u.search = "";
+      u.searchParams.set("s", String(stats.score));
+      u.searchParams.set("c", String(stats.bestCombo));
+      u.searchParams.set("a", String(accuracy));
+      u.searchParams.set("d", stats.difficulty);
+      setShareUrl(u.toString());
+    } catch {
+      setShareUrl("");
+    }
+  }, [difficulty, statsAll]);
 
   const startGame = useCallback(async () => {
     const cfg = DIFFICULTIES[difficulty];
-    // reset
     notesRef.current = [];
     noteIdRef.current = 0;
     scoreRef.current = 0;
@@ -326,6 +475,9 @@ export default function PixelPulseRush() {
     perfectWindowRef.current = cfg.perfectWindow;
     setHud({ score: 0, combo: 0, misses: 0, best: 0 });
     setFinalStats(null);
+
+    // Stop any prior engine
+    engineRef.current?.stop();
 
     const bpm = cfg.bpm + (Math.random() * 2 - 1) * cfg.bpmJitter;
     const engine = new ChiptuneEngine(bpm, cfg.density);
@@ -350,16 +502,39 @@ export default function PixelPulseRush() {
     });
   }, [difficulty]);
 
+  const pauseGame = useCallback(() => {
+    if (stateRef.current !== "playing") return;
+    stateRef.current = "paused";
+    setState("paused");
+    engineRef.current?.pause();
+  }, []);
+
+  const resumeGame = useCallback(async () => {
+    if (stateRef.current !== "paused") return;
+    await engineRef.current?.unpause();
+    stateRef.current = "playing";
+    setState("playing");
+  }, []);
+
+  const quitToMenu = useCallback(() => {
+    engineRef.current?.stop();
+    engineRef.current = null;
+    notesRef.current = [];
+    stateRef.current = "idle";
+    setState("idle");
+  }, []);
+
   const tapLane = useCallback((lane: number) => {
     if (stateRef.current !== "playing") return;
     const engine = engineRef.current;
     if (!engine) return;
     const now = engine.ctx.currentTime;
+    const offset = latencyOffsetRef.current;
     let best: Note | null = null;
     let bestDelta = Infinity;
     for (const n of notesRef.current) {
       if (n.lane !== lane || n.judged) continue;
-      const d = Math.abs((n.hitAt - now) * 1000);
+      const d = Math.abs((n.hitAt - now) * 1000 - offset);
       if (d < bestDelta) {
         bestDelta = d;
         best = n;
@@ -396,18 +571,43 @@ export default function PixelPulseRush() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.repeat) return;
-      const idx = LANE_KEYS.indexOf(e.key.toLowerCase() as (typeof LANE_KEYS)[number]);
-      if (idx >= 0) {
+      const k = e.key.toLowerCase();
+      const idx = LANE_KEYS.indexOf(k as (typeof LANE_KEYS)[number]);
+      if (idx >= 0 && stateRef.current === "playing") {
         e.preventDefault();
         tapLane(idx);
-      } else if (e.key === " " && (stateRef.current === "idle" || stateRef.current === "over")) {
+      } else if (
+        e.key === " " &&
+        (stateRef.current === "idle" || stateRef.current === "over")
+      ) {
         e.preventDefault();
         startGame();
+      } else if (
+        (e.key === "Escape" || k === "p") &&
+        stateRef.current === "playing"
+      ) {
+        e.preventDefault();
+        pauseGame();
+      } else if (
+        (e.key === "Escape" || k === "p") &&
+        stateRef.current === "paused"
+      ) {
+        e.preventDefault();
+        resumeGame();
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [tapLane, startGame]);
+  }, [tapLane, startGame, pauseGame, resumeGame]);
+
+  // Auto-pause on tab hide
+  useEffect(() => {
+    const onVis = () => {
+      if (document.hidden && stateRef.current === "playing") pauseGame();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [pauseGame]);
 
   // main render loop
   useEffect(() => {
@@ -513,7 +713,7 @@ export default function PixelPulseRush() {
           ctx.fillStyle = "rgba(255,255,255,0.35)";
           ctx.fillRect(x + 4, y - h / 2 + 4, w - 8, 3);
 
-          if ((now - n.hitAt) * 1000 > hitWindowRef.current) {
+          if ((now - n.hitAt) * 1000 > hitWindowRef.current + latencyOffsetRef.current) {
             n.judged = true;
             n.missed = true;
             comboRef.current = 0;
@@ -581,7 +781,6 @@ export default function PixelPulseRush() {
     };
   }, [endGame]);
 
-  // Convert a client X coordinate on the tap-zone element to a lane index.
   const laneFromClientX = (host: HTMLElement, clientX: number) => {
     const rect = host.getBoundingClientRect();
     const rel = clientX - rect.left;
@@ -598,7 +797,6 @@ export default function PixelPulseRush() {
     (e.currentTarget as HTMLDivElement).setPointerCapture?.(e.pointerId);
     tapLane(lane);
   };
-
   const onZonePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!activeTouchesRef.current.has(e.pointerId)) return;
     const lane = laneFromClientX(e.currentTarget, e.clientX);
@@ -609,15 +807,18 @@ export default function PixelPulseRush() {
       tapLane(lane);
     }
   };
-
   const onZonePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     activeTouchesRef.current.delete(e.pointerId);
   };
 
+  // ---------- Share ----------
+  const buildShareText = (fs: FinalStats) =>
+    `🕹️ Pixel Pulse Rush [${DIFFICULTIES[fs.difficulty].label}]\nScore ${fs.score} · Combo ${fs.bestCombo}x · ${fs.accuracy}% acc — beat my run:`;
+
   const shareScore = async () => {
     if (!finalStats) return;
-    const text = `🕹️ Pixel Pulse Rush [${DIFFICULTIES[finalStats.difficulty].label}]\nScore ${finalStats.score} · Combo ${finalStats.bestCombo}x · ${finalStats.accuracy}% acc\nBeat my run:`;
-    const url = typeof window !== "undefined" ? window.location.href : "";
+    const text = buildShareText(finalStats);
+    const url = shareUrl || window.location.href;
     try {
       if (navigator.share) {
         await navigator.share({ title: "Pixel Pulse Rush", text, url });
@@ -627,12 +828,35 @@ export default function PixelPulseRush() {
       /* ignore */
     }
     try {
-      await navigator.clipboard.writeText(`${text} ${url}`);
-      alert("Score copied to clipboard!");
+      await navigator.clipboard.writeText(`${text}\n${url}`);
+      alert("Score link copied to clipboard!");
     } catch {
-      alert(text);
+      alert(`${text}\n${url}`);
     }
   };
+
+  const copyShareLink = async () => {
+    const url = shareUrl || window.location.href;
+    try {
+      await navigator.clipboard.writeText(url);
+      alert("Link copied!");
+    } catch {
+      prompt("Copy this link:", url);
+    }
+  };
+
+  const socialLinks = useMemo(() => {
+    if (!finalStats) return null;
+    const text = buildShareText(finalStats);
+    const url = shareUrl || (typeof window !== "undefined" ? window.location.href : "");
+    const enc = encodeURIComponent;
+    return {
+      twitter: `https://twitter.com/intent/tweet?text=${enc(text)}&url=${enc(url)}`,
+      facebook: `https://www.facebook.com/sharer/sharer.php?u=${enc(url)}&quote=${enc(text)}`,
+      reddit: `https://www.reddit.com/submit?url=${enc(url)}&title=${enc(`Pixel Pulse Rush — ${finalStats.score}`)}`,
+      whatsapp: `https://api.whatsapp.com/send?text=${enc(`${text} ${url}`)}`,
+    };
+  }, [finalStats, shareUrl]);
 
   const buildCardCanvas = () => {
     if (!finalStats) return null;
@@ -699,7 +923,6 @@ export default function PixelPulseRush() {
     const c = buildCardCanvas();
     if (!c || !finalStats) return;
     const imgData = c.toDataURL("image/jpeg", 0.92);
-    // Minimal single-page PDF with an embedded JPEG (landscape, 1200x630 pt).
     const jpegBinary = atob(imgData.split(",")[1]);
     const jpegBytes = new Uint8Array(jpegBinary.length);
     for (let i = 0; i < jpegBinary.length; i++) jpegBytes[i] = jpegBinary.charCodeAt(i);
@@ -742,7 +965,6 @@ export default function PixelPulseRush() {
     }
     push(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`);
 
-    // Concatenate to Blob
     const blobParts: BlobPart[] = parts.map((p) =>
       typeof p === "string" ? p : new Uint8Array(p),
     );
@@ -753,6 +975,104 @@ export default function PixelPulseRush() {
     a.download = `pixel-pulse-rush-${finalStats.score}.pdf`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  // ---------- Calibration ----------
+  const calibRef = useRef<{
+    ctx: AudioContext;
+    startAt: number;
+    interval: number;
+    taps: number[];
+    total: number;
+  } | null>(null);
+  const [calProgress, setCalProgress] = useState<
+    | null
+    | { taps: number; total: number; offset: number }
+  >(null);
+
+  const startCalibration = async () => {
+    const Ctor: typeof AudioContext =
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext || window.AudioContext;
+    const ctx = new Ctor();
+    await ctx.resume();
+    const interval = 0.5; // 120 BPM
+    const total = 8;
+    const startAt = ctx.currentTime + 0.8;
+    for (let i = 0; i < total + 2; i++) {
+      const when = startAt + i * interval;
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "square";
+      o.frequency.value = i === 0 ? 660 : 880;
+      g.gain.setValueAtTime(0.0001, when);
+      g.gain.exponentialRampToValueAtTime(0.3, when + 0.005);
+      g.gain.exponentialRampToValueAtTime(0.0001, when + 0.09);
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.start(when);
+      o.stop(when + 0.12);
+    }
+    calibRef.current = { ctx, startAt, interval, taps: [], total };
+    stateRef.current = "calibrating";
+    setState("calibrating");
+    setCalProgress({ taps: 0, total, offset: 0 });
+  };
+
+  const calibrationTap = () => {
+    const c = calibRef.current;
+    if (!c) return;
+    const now = c.ctx.currentTime;
+    const elapsed = now - c.startAt;
+    if (elapsed < -0.1) return;
+    const beatIdx = Math.max(0, Math.round(elapsed / c.interval));
+    const beatTime = beatIdx * c.interval;
+    const deltaMs = (elapsed - beatTime) * 1000;
+    if (Math.abs(deltaMs) > 300) return; // reject wild taps
+    c.taps.push(deltaMs);
+    const avg = c.taps.reduce((a, b) => a + b, 0) / c.taps.length;
+    setCalProgress({ taps: c.taps.length, total: c.total, offset: avg });
+    if (c.taps.length >= c.total) finishCalibration(avg);
+  };
+
+  const finishCalibration = (offset: number) => {
+    const clamped = Math.max(-150, Math.min(150, Math.round(offset)));
+    latencyOffsetRef.current = clamped;
+    setLatencyOffset(clamped);
+    saveOffset(clamped);
+    const c = calibRef.current;
+    if (c) {
+      try {
+        c.ctx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    calibRef.current = null;
+    setCalProgress(null);
+    stateRef.current = "idle";
+    setState("idle");
+  };
+
+  const cancelCalibration = () => {
+    const c = calibRef.current;
+    if (c) {
+      try {
+        c.ctx.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    calibRef.current = null;
+    setCalProgress(null);
+    stateRef.current = "idle";
+    setState("idle");
+  };
+
+  const resetCalibration = () => {
+    latencyOffsetRef.current = 0;
+    setLatencyOffset(0);
+    saveOffset(0);
   };
 
   const diffKeys = useMemo(() => Object.keys(DIFFICULTIES) as Difficulty[], []);
@@ -775,7 +1095,6 @@ export default function PixelPulseRush() {
           className="w-full h-full block touch-none select-none pointer-events-none"
         />
 
-        {/* Touch hitboxes — bottom 45% of playfield, one per lane */}
         {state === "playing" && (
           <div
             className="absolute left-0 right-0 flex touch-none select-none"
@@ -818,9 +1137,21 @@ export default function PixelPulseRush() {
             />
           ))}
         </div>
+
+        {/* Pause button during play */}
+        {state === "playing" && (
+          <button
+            onClick={pauseGame}
+            aria-label="Pause"
+            className="absolute top-2 left-1/2 -translate-x-1/2 z-20 font-display text-[10px] px-3 py-2 rounded bg-black/60 border border-white/20 text-white/90 backdrop-blur-sm hover:bg-black/80"
+          >
+            ❚❚ PAUSE
+          </button>
+        )}
+
         <div className="absolute top-2 right-2 text-[10px] sm:text-xs font-display text-glow-cyan flex flex-col items-end gap-1">
           <span>BEST {hud.best}x</span>
-          {state === "playing" && (
+          {(state === "playing" || state === "paused") && (
             <span className="text-glow-yellow opacity-80">
               {DIFFICULTIES[difficulty].label}
             </span>
@@ -829,15 +1160,23 @@ export default function PixelPulseRush() {
 
         {state === "idle" && (
           <Overlay>
-            <h2 className="font-display text-glow-pink text-lg sm:text-2xl mb-3">
+            <h2 className="font-display text-glow-pink text-lg sm:text-2xl mb-2">
               PIXEL PULSE RUSH
             </h2>
-            <p className="max-w-xs text-sm text-muted-foreground mb-4 leading-relaxed">
-              Tap the neon blocks as they hit the line. Every run generates a
-              unique chiptune. Miss 3 and your pulse flatlines.
+
+            {challenge && (
+              <div className="mb-3 px-3 py-2 rounded border border-[var(--neon-yellow)] bg-[var(--neon-yellow)]/10 text-[11px] text-glow-yellow max-w-xs">
+                CHALLENGE · {DIFFICULTIES[challenge.diff].label} ·{" "}
+                {challenge.score} pts · {challenge.combo}x · {challenge.acc}%
+              </div>
+            )}
+
+            <p className="max-w-xs text-sm text-muted-foreground mb-3 leading-relaxed">
+              Tap the neon blocks as they hit the line. Miss 3 and your pulse
+              flatlines.
             </p>
 
-            <div className="w-full max-w-xs mb-4">
+            <div className="w-full max-w-xs mb-3">
               <div className="text-[10px] font-display text-glow-cyan mb-2 tracking-widest">
                 DIFFICULTY
               </div>
@@ -856,26 +1195,161 @@ export default function PixelPulseRush() {
                   </button>
                 ))}
               </div>
-              <div className="mt-2 text-[11px] text-muted-foreground min-h-[2.5em]">
+              <div className="mt-1 text-[11px] text-muted-foreground min-h-[2.5em]">
                 {DIFFICULTIES[difficulty].blurb}
               </div>
             </div>
 
-            <div className="text-xs mb-4 space-y-1 opacity-80">
-              <div>
-                <span className="text-glow-yellow">KEYS</span> D F J K
+            {/* Per-difficulty stats */}
+            <div className="w-full max-w-xs mb-3 border border-border/60 rounded p-2 bg-black/30">
+              <div className="text-[10px] font-display text-glow-cyan mb-1 tracking-widest text-left">
+                BEST — {DIFFICULTIES[difficulty].label}
               </div>
-              <div>
-                <span className="text-glow-yellow">MOBILE</span> tap the lanes
+              <div className="grid grid-cols-4 gap-1 text-[10px] font-mono text-left">
+                <div>
+                  <div className="text-muted-foreground">SCORE</div>
+                  <div className="text-glow-yellow text-sm">
+                    {statsAll[difficulty].bestScore}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">COMBO</div>
+                  <div className="text-glow-pink text-sm">
+                    {statsAll[difficulty].bestCombo}x
+                  </div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">ACC</div>
+                  <div className="text-glow-cyan text-sm">
+                    {statsAll[difficulty].bestAccuracy}%
+                  </div>
+                </div>
+                <div>
+                  <div className="text-muted-foreground">RUNS</div>
+                  <div className="text-white text-sm">
+                    {statsAll[difficulty].plays}
+                  </div>
+                </div>
               </div>
             </div>
-            <button
-              onClick={startGame}
-              className="font-display text-xs px-5 py-3 rounded bg-[var(--neon-pink)] text-black hover:brightness-110 active:translate-y-px shadow-[0_0_24px_-2px_var(--neon-pink)]"
-            >
-              PRESS START
-            </button>
+
+            <div className="flex flex-col items-center gap-2 mb-3">
+              <button
+                onClick={startGame}
+                className="font-display text-xs px-5 py-3 rounded bg-[var(--neon-pink)] text-black hover:brightness-110 active:translate-y-px shadow-[0_0_24px_-2px_var(--neon-pink)]"
+              >
+                PRESS START
+              </button>
+              <div className="flex gap-2 items-center text-[10px] font-mono text-muted-foreground">
+                <button
+                  onClick={startCalibration}
+                  className="font-display text-[9px] px-2 py-1 rounded border border-[var(--neon-cyan)] text-glow-cyan hover:bg-[var(--neon-cyan)]/10"
+                >
+                  CALIBRATE
+                </button>
+                <span>
+                  offset {latencyOffset >= 0 ? "+" : ""}
+                  {latencyOffset}ms
+                </span>
+                {latencyOffset !== 0 && (
+                  <button
+                    onClick={resetCalibration}
+                    className="underline hover:text-white"
+                  >
+                    reset
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="text-[10px] opacity-70 font-mono">
+              KEYS D F J K · SPACE start · ESC/P pause
+            </div>
           </Overlay>
+        )}
+
+        {state === "paused" && (
+          <Overlay>
+            <h2 className="font-display text-glow-cyan text-lg sm:text-2xl mb-4">
+              PAUSED
+            </h2>
+            <div className="text-sm mb-4 space-y-1 text-center">
+              <div>
+                <span className="text-glow-yellow">SCORE</span> {hud.score}
+              </div>
+              <div>
+                <span className="text-glow-pink">COMBO</span> {hud.combo}x ·
+                BEST {hud.best}x
+              </div>
+            </div>
+            <div className="flex flex-col gap-2 w-full max-w-[220px]">
+              <button
+                onClick={resumeGame}
+                className="font-display text-xs px-4 py-3 rounded bg-[var(--neon-green)] text-black hover:brightness-110 shadow-[0_0_20px_-2px_var(--neon-green)]"
+              >
+                ▶ RESUME
+              </button>
+              <button
+                onClick={startGame}
+                className="font-display text-xs px-4 py-3 rounded bg-[var(--neon-yellow)] text-black hover:brightness-110 shadow-[0_0_20px_-2px_var(--neon-yellow)]"
+              >
+                ↻ RESTART
+              </button>
+              <button
+                onClick={quitToMenu}
+                className="font-display text-[10px] px-4 py-2 rounded border border-white/30 text-white/80 hover:bg-white/10"
+              >
+                QUIT
+              </button>
+            </div>
+          </Overlay>
+        )}
+
+        {state === "calibrating" && calProgress && (
+          <div
+            className="absolute inset-0 flex flex-col items-center justify-center text-center bg-black/70 backdrop-blur-sm px-4 z-10 touch-none select-none"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              calibrationTap();
+            }}
+          >
+            <h2 className="font-display text-glow-yellow text-base sm:text-xl mb-2">
+              CALIBRATE
+            </h2>
+            <p className="text-[12px] text-muted-foreground max-w-xs mb-4">
+              Tap anywhere in time with the beeps. We'll match the timing window
+              to your device's audio latency.
+            </p>
+            <div className="font-display text-glow-cyan text-3xl mb-2">
+              {calProgress.taps} / {calProgress.total}
+            </div>
+            <div className="text-xs text-muted-foreground mb-4">
+              offset {calProgress.offset >= 0 ? "+" : ""}
+              {Math.round(calProgress.offset)}ms
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cancelCalibration();
+                }}
+                className="font-display text-[10px] px-3 py-2 rounded border border-white/30 text-white/80 hover:bg-white/10"
+              >
+                CANCEL
+              </button>
+              {calProgress.taps >= 3 && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    finishCalibration(calProgress.offset);
+                  }}
+                  className="font-display text-[10px] px-3 py-2 rounded bg-[var(--neon-green)] text-black"
+                >
+                  SAVE
+                </button>
+              )}
+            </div>
+          </div>
         )}
 
         {state === "over" && finalStats && (
@@ -884,12 +1358,19 @@ export default function PixelPulseRush() {
               FLATLINE
             </h2>
             <div className="text-[10px] font-display text-glow-cyan mb-2 tracking-widest">
-              {DIFFICULTIES[finalStats.difficulty].label} · {Math.round(finalStats.bpm)} BPM
+              {DIFFICULTIES[finalStats.difficulty].label} ·{" "}
+              {Math.round(finalStats.bpm)} BPM
             </div>
-            <div className="font-display text-glow-yellow text-3xl sm:text-5xl mb-3">
+            <div className="font-display text-glow-yellow text-3xl sm:text-5xl mb-1">
               {finalStats.score}
             </div>
-            <div className="text-sm space-y-1 mb-4">
+            {(finalStats.newBestScore || finalStats.newBestCombo) && (
+              <div className="mb-2 text-[10px] font-display text-glow-pink animate-pulse">
+                {finalStats.newBestScore ? "NEW BEST SCORE! " : ""}
+                {finalStats.newBestCombo ? "NEW BEST COMBO!" : ""}
+              </div>
+            )}
+            <div className="text-sm space-y-1 mb-3">
               <div>
                 <span className="text-glow-cyan">COMBO</span>{" "}
                 {finalStats.bestCombo}x
@@ -899,16 +1380,23 @@ export default function PixelPulseRush() {
                 {finalStats.accuracy}%
               </div>
               <div>
-                <span className="text-glow-cyan">HITS</span> {finalStats.hits}/
-                {finalStats.total}
+                <span className="text-glow-cyan">HITS</span>{" "}
+                {finalStats.hits}/{finalStats.total}
               </div>
             </div>
-            <div className="flex flex-wrap gap-2 justify-center">
+
+            <div className="flex flex-wrap gap-2 justify-center mb-2">
               <button
                 onClick={startGame}
                 className="font-display text-[10px] px-4 py-2 rounded bg-[var(--neon-pink)] text-black hover:brightness-110 shadow-[0_0_20px_-2px_var(--neon-pink)]"
               >
                 RETRY
+              </button>
+              <button
+                onClick={quitToMenu}
+                className="font-display text-[10px] px-4 py-2 rounded border border-white/30 text-white/80 hover:bg-white/10"
+              >
+                MENU
               </button>
               <button
                 onClick={shareScore}
@@ -917,18 +1405,61 @@ export default function PixelPulseRush() {
                 SHARE
               </button>
               <button
+                onClick={copyShareLink}
+                className="font-display text-[10px] px-4 py-2 rounded border border-[var(--neon-cyan)] text-glow-cyan hover:bg-[var(--neon-cyan)]/10"
+              >
+                COPY LINK
+              </button>
+              <button
                 onClick={downloadCard}
                 className="font-display text-[10px] px-4 py-2 rounded bg-[var(--neon-yellow)] text-black hover:brightness-110 shadow-[0_0_20px_-2px_var(--neon-yellow)]"
               >
-                SAVE PNG
+                PNG
               </button>
               <button
                 onClick={downloadCardPdf}
                 className="font-display text-[10px] px-4 py-2 rounded bg-[var(--neon-green)] text-black hover:brightness-110 shadow-[0_0_20px_-2px_var(--neon-green)]"
               >
-                SAVE PDF
+                PDF
               </button>
             </div>
+
+            {socialLinks && (
+              <div className="flex gap-2 justify-center text-[10px] font-display">
+                <a
+                  href={socialLinks.twitter}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2 py-1 rounded border border-white/20 hover:border-[var(--neon-cyan)] hover:text-glow-cyan"
+                >
+                  X
+                </a>
+                <a
+                  href={socialLinks.facebook}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2 py-1 rounded border border-white/20 hover:border-[var(--neon-cyan)] hover:text-glow-cyan"
+                >
+                  FB
+                </a>
+                <a
+                  href={socialLinks.reddit}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2 py-1 rounded border border-white/20 hover:border-[var(--neon-cyan)] hover:text-glow-cyan"
+                >
+                  REDDIT
+                </a>
+                <a
+                  href={socialLinks.whatsapp}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2 py-1 rounded border border-white/20 hover:border-[var(--neon-cyan)] hover:text-glow-cyan"
+                >
+                  WA
+                </a>
+              </div>
+            )}
           </Overlay>
         )}
       </div>
@@ -942,7 +1473,7 @@ export default function PixelPulseRush() {
 
 function Overlay({ children }: { children: React.ReactNode }) {
   return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center text-center bg-black/60 backdrop-blur-sm px-4 z-10">
+    <div className="absolute inset-0 flex flex-col items-center justify-center text-center bg-black/60 backdrop-blur-sm px-4 z-10 overflow-y-auto py-6">
       {children}
     </div>
   );
