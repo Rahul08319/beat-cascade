@@ -575,6 +575,12 @@ export default function PixelPulseRush() {
     const engine = new ChiptuneEngine(bpm, cfg.density);
     engineRef.current = engine;
     await engine.resume();
+    try {
+      engine.master.gain.value = mutedRef.current ? 0 : 0.35;
+    } catch {
+      /* ignore */
+    }
+
     stateRef.current = "playing";
     setState("playing");
     engine.start((beat, hitTime, lanes) => {
