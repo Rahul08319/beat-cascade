@@ -102,6 +102,12 @@ function RootShell({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <head>
+        {/*
+          YouTube Playables SDK — MUST load before any game code so it can set up
+          its sandboxed environment. See https://developers.google.com/youtube/gaming/playables
+          Runs as a no-op when the game is served outside of the Playables env.
+        */}
+        <script src="https://www.youtube.com/game_api/v1" async={false} />
         <HeadContent />
       </head>
       <body>
