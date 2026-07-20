@@ -383,6 +383,9 @@ export default function PixelPulseRush() {
   const hitsRef = useRef(0);
   const totalRef = useRef(0);
   const activeTouchesRef = useRef<Map<number, number>>(new Map());
+  const mutedRef = useRef(false);
+  const cloudReadyRef = useRef(false);
+
 
   // Load persisted stats + offset + parse challenge URL
   useEffect(() => {
