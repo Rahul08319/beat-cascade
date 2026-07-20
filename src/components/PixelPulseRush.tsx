@@ -532,6 +532,10 @@ export default function PixelPulseRush() {
     };
     setStatsAll(next);
     saveStats(next);
+    // Push best-score to YouTube leaderboards and mirror stats to cloud save.
+    void ytg.sendScore(next[difficulty].bestScore);
+    void ytg.saveCloudData(JSON.stringify(next));
+
 
     try {
       const u = new URL(window.location.href);
