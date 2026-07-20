@@ -412,6 +412,89 @@ export default function PixelPulseRush() {
     }
   }, []);
 
+  // YouTube Playables SDK lifecycle. Runs as a no-op outside of Playables.
+  useEffect(() => {
+    let cancelled = false;
+
+    // Initial audio state from YT settings.
+    mutedRef.current = !ytg.isAudioEnabled();
+
+    // Merge any cloud save into local stats (cloud wins on higher values).
+    (async () => {
+      const raw = await ytg.loadCloudData();
+      if (cancelled || !raw) {
+        cloudReadyRef.current = true;
+        return;
+      }
+      try {
+        const cloud = JSON.parse(raw) as Partial<AllStats>;
+        setStatsAll((cur) => {
+          const merged: AllStats = { ...cur };
+          (Object.keys(EMPTY_STATS) as Difficulty[]).forEach((d) => {
+            const a = cur[d];
+            const b = cloud[d];
+            if (!b) return;
+            merged[d] = {
+              bestScore: Math.max(a.bestScore, b.bestScore ?? 0),
+              bestCombo: Math.max(a.bestCombo, b.bestCombo ?? 0),
+              bestAccuracy: Math.max(a.bestAccuracy, b.bestAccuracy ?? 0),
+              plays: Math.max(a.plays, b.plays ?? 0),
+            };
+          });
+          saveStats(merged);
+          return merged;
+        });
+      } catch {
+        /* corrupted cloud payload — ignore */
+      }
+      cloudReadyRef.current = true;
+    })();
+
+    // Signal SDK milestones. firstFrameReady after paint, gameReady when interactable.
+    const raf = requestAnimationFrame(() => {
+      ytg.firstFrameReady();
+      // The idle menu is interactable immediately.
+      ytg.gameReady();
+    });
+
+    // React to YouTube-driven audio, pause and resume.
+    const offAudio = ytg.onAudioEnabledChange((enabled) => {
+      mutedRef.current = !enabled;
+      const eng = engineRef.current;
+      if (eng) {
+        try {
+          eng.master.gain.value = enabled ? 0.35 : 0;
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+    const offPause = ytg.onPause(() => {
+      if (stateRef.current === "playing") {
+        stateRef.current = "paused";
+        setState("paused");
+        engineRef.current?.pause();
+      }
+    });
+    const offResume = ytg.onResume(() => {
+      if (stateRef.current === "paused") {
+        void engineRef.current?.unpause().then(() => {
+          stateRef.current = "playing";
+          setState("playing");
+        });
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      offAudio();
+      offPause();
+      offResume();
+    };
+  }, []);
+
+
   const endGame = useCallback(() => {
     if (stateRef.current !== "playing" && stateRef.current !== "paused") return;
     stateRef.current = "over";
