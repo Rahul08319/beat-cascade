@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as ytg from "@/lib/ytgame";
+
 
 /* ============================================================
  * Pixel Pulse Rush
