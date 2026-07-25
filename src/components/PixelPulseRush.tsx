@@ -707,7 +707,12 @@ export default function PixelPulseRush() {
     stateRef.current = "paused";
     setState("paused");
     engineRef.current?.pause();
-  }, []);
+    // Natural break: pause is a good spot for an interstitial (rate-limited).
+    if (!shownInterstitialThisRunRef.current) {
+      shownInterstitialThisRunRef.current = true;
+      void tryInterstitial();
+    }
+  }, [tryInterstitial]);
 
   const resumeGame = useCallback(async () => {
     if (stateRef.current !== "paused") return;
