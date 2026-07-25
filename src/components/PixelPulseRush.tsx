@@ -1016,6 +1016,57 @@ export default function PixelPulseRush() {
     activeTouchesRef.current.delete(e.pointerId);
   };
 
+  // ---------- Rewarded ad (bonus points on the score card) ----------
+  const REWARD_BONUS_POINTS = 500;
+  const REWARD_ID = "score-bonus-500";
+
+  const claimRewardedBonus = useCallback(async () => {
+    if (!finalStats || rewardGranted || rewardPending) return;
+    setRewardPending(true);
+    const earned = await ytg.requestRewardedAd(REWARD_ID);
+    setRewardPending(false);
+    if (!earned) {
+      // Graceful fallback: ad failed, wasn't watched to completion, or
+      // Playables env is unavailable. Leave the button available for retry.
+      return;
+    }
+    // Apply the bonus to the final-stats card and persist a new best if beaten.
+    const bonusScore = finalStats.score + REWARD_BONUS_POINTS;
+    const updated: FinalStats = {
+      ...finalStats,
+      score: bonusScore,
+      newBestScore:
+        finalStats.newBestScore || bonusScore > statsAll[finalStats.difficulty].bestScore,
+    };
+    setFinalStats(updated);
+    setRewardGranted(true);
+
+    const prev = statsAll[updated.difficulty];
+    if (bonusScore > prev.bestScore) {
+      const next: AllStats = {
+        ...statsAll,
+        [updated.difficulty]: { ...prev, bestScore: bonusScore },
+      };
+      setStatsAll(next);
+      saveStats(next);
+      void ytg.sendScore(bonusScore);
+      void ytg.saveCloudData(encodeCloudPayload(next));
+    }
+
+    // Refresh the share URL to reflect the bonused score.
+    try {
+      const u = new URL(window.location.href);
+      u.search = "";
+      u.searchParams.set("s", String(bonusScore));
+      u.searchParams.set("c", String(updated.bestCombo));
+      u.searchParams.set("a", String(updated.accuracy));
+      u.searchParams.set("d", updated.difficulty);
+      setShareUrl(u.toString());
+    } catch {
+      /* ignore */
+    }
+  }, [finalStats, rewardGranted, rewardPending, statsAll]);
+
   // ---------- Share ----------
   const buildShareText = (fs: FinalStats) =>
     `🕹️ Pixel Pulse Rush [${DIFFICULTIES[fs.difficulty].label}]\nScore ${fs.score} · Combo ${fs.bestCombo}x · ${fs.accuracy}% acc — beat my run:`;
