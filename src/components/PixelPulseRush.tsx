@@ -495,33 +495,38 @@ export default function PixelPulseRush() {
     mutedRef.current = !ytg.isAudioEnabled();
 
     // Merge any cloud save into local stats (cloud wins on higher values).
+    // Payload is versioned (see migrateCloudPayload) so older saves are
+    // upgraded transparently and unknown-future saves are salvaged if possible.
     (async () => {
       const raw = await ytg.loadCloudData();
       if (cancelled || !raw) {
         cloudReadyRef.current = true;
         return;
       }
-      try {
-        const cloud = JSON.parse(raw) as Partial<AllStats>;
-        setStatsAll((cur) => {
-          const merged: AllStats = { ...cur };
-          (Object.keys(EMPTY_STATS) as Difficulty[]).forEach((d) => {
-            const a = cur[d];
-            const b = cloud[d];
-            if (!b) return;
-            merged[d] = {
-              bestScore: Math.max(a.bestScore, b.bestScore ?? 0),
-              bestCombo: Math.max(a.bestCombo, b.bestCombo ?? 0),
-              bestAccuracy: Math.max(a.bestAccuracy, b.bestAccuracy ?? 0),
-              plays: Math.max(a.plays, b.plays ?? 0),
-            };
-          });
-          saveStats(merged);
-          return merged;
-        });
-      } catch {
-        /* corrupted cloud payload — ignore */
+      const migrated = migrateCloudPayload(raw);
+      if (!migrated) {
+        cloudReadyRef.current = true;
+        return;
       }
+      const cloud = migrated.stats;
+      setStatsAll((cur) => {
+        const merged: AllStats = { ...cur };
+        (Object.keys(EMPTY_STATS) as Difficulty[]).forEach((d) => {
+          const a = cur[d];
+          const b = cloud[d];
+          if (!b) return;
+          merged[d] = {
+            bestScore: Math.max(a.bestScore, b.bestScore ?? 0),
+            bestCombo: Math.max(a.bestCombo, b.bestCombo ?? 0),
+            bestAccuracy: Math.max(a.bestAccuracy, b.bestAccuracy ?? 0),
+            plays: Math.max(a.plays, b.plays ?? 0),
+          };
+        });
+        saveStats(merged);
+        // Rewrite cloud in the current envelope so legacy v1 saves get upgraded.
+        void ytg.saveCloudData(encodeCloudPayload(merged));
+        return merged;
+      });
       cloudReadyRef.current = true;
     })();
 
