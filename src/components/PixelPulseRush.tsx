@@ -666,6 +666,9 @@ export default function PixelPulseRush() {
     perfectWindowRef.current = cfg.perfectWindow;
     setHud({ score: 0, combo: 0, misses: 0, best: 0 });
     setFinalStats(null);
+    setRewardGranted(false);
+    setRewardPending(false);
+    shownInterstitialThisRunRef.current = false;
 
     // Stop any prior engine
     engineRef.current?.stop();
