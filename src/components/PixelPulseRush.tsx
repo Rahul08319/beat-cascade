@@ -575,6 +575,16 @@ export default function PixelPulseRush() {
   }, []);
 
 
+  // Try to surface an interstitial at a natural break. Silently no-ops when
+  // outside Playables, on cooldown, or if the ad request fails.
+  const tryInterstitial = useCallback(async () => {
+    const now = Date.now();
+    if (now - lastInterstitialAtRef.current < INTERSTITIAL_MIN_INTERVAL_MS) return;
+    lastInterstitialAtRef.current = now;
+    // Fire-and-forget: any rejection is swallowed by the SDK wrapper.
+    void ytg.requestInterstitialAd();
+  }, []);
+
   const endGame = useCallback(() => {
     if (stateRef.current !== "playing" && stateRef.current !== "paused") return;
     stateRef.current = "over";
@@ -600,6 +610,8 @@ export default function PixelPulseRush() {
       newBestCombo,
     };
     setFinalStats(stats);
+    setRewardGranted(false);
+    setRewardPending(false);
 
     const next: AllStats = {
       ...statsAll,
@@ -612,9 +624,10 @@ export default function PixelPulseRush() {
     };
     setStatsAll(next);
     saveStats(next);
-    // Push best-score to YouTube leaderboards and mirror stats to cloud save.
+    // Push best-score to YouTube leaderboards and mirror stats to cloud save
+    // using the current versioned envelope.
     void ytg.sendScore(next[difficulty].bestScore);
-    void ytg.saveCloudData(JSON.stringify(next));
+    void ytg.saveCloudData(encodeCloudPayload(next));
 
 
     try {
@@ -628,7 +641,13 @@ export default function PixelPulseRush() {
     } catch {
       setShareUrl("");
     }
-  }, [difficulty, statsAll]);
+
+    // Natural break: game over. Only if we didn't already show one this run.
+    if (!shownInterstitialThisRunRef.current) {
+      shownInterstitialThisRunRef.current = true;
+      void tryInterstitial();
+    }
+  }, [difficulty, statsAll, tryInterstitial]);
 
   const startGame = useCallback(async () => {
     const cfg = DIFFICULTIES[difficulty];
