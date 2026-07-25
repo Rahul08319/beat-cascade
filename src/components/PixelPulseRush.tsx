@@ -1641,7 +1641,21 @@ export default function PixelPulseRush() {
               </div>
             </div>
 
-            <div className="flex flex-wrap gap-2 justify-center mb-2">
+            {/* Rewarded ad: grants a one-time score bonus per game-over screen. */}
+            <div className="mb-2 w-full max-w-[260px] mx-auto">
+              <button
+                onClick={claimRewardedBonus}
+                disabled={rewardGranted || rewardPending}
+                className="w-full font-display text-[10px] px-4 py-3 rounded bg-gradient-to-r from-[var(--neon-pink)] to-[var(--neon-yellow)] text-black hover:brightness-110 disabled:opacity-60 disabled:cursor-not-allowed shadow-[0_0_20px_-2px_var(--neon-yellow)]"
+              >
+                {rewardGranted
+                  ? `✓ +${REWARD_BONUS_POINTS} BONUS APPLIED`
+                  : rewardPending
+                    ? "LOADING AD…"
+                    : `🎁 WATCH AD · +${REWARD_BONUS_POINTS} PTS`}
+              </button>
+            </div>
+
               <button
                 onClick={startGame}
                 className="font-display text-[10px] px-4 py-2 rounded bg-[var(--neon-pink)] text-black hover:brightness-110 shadow-[0_0_20px_-2px_var(--neon-pink)]"
