@@ -60,6 +60,10 @@ const DIFFICULTIES: Record<Difficulty, DifficultyConfig> = {
 const STATS_KEY = "ppr:stats:v1";
 const OFFSET_KEY = "ppr:offset:v1";
 
+// Current cloud-save schema version. Bump when the shape of `stats` changes
+// and add a case to `migrateCloudPayload` below.
+const CLOUD_SAVE_VERSION = 2;
+
 type DiffStats = {
   bestScore: number;
   bestCombo: number;
@@ -72,6 +76,66 @@ const EMPTY_STATS: AllStats = {
   normal: { bestScore: 0, bestCombo: 0, bestAccuracy: 0, plays: 0 },
   hard: { bestScore: 0, bestCombo: 0, bestAccuracy: 0, plays: 0 },
 };
+
+/**
+ * Versioned cloud-save envelope. Older builds wrote raw AllStats without
+ * a wrapper (implicit v1). New builds always write { v, stats }.
+ * When the schema evolves, bump CLOUD_SAVE_VERSION and add a migration
+ * branch — never mutate the shape of an existing version in place.
+ */
+type CloudSaveV2 = { v: 2; stats: AllStats };
+type CloudSave = CloudSaveV2;
+
+function coerceDiffStats(x: unknown): DiffStats {
+  const o = (x ?? {}) as Partial<DiffStats>;
+  return {
+    bestScore: Math.max(0, Math.floor(Number(o.bestScore) || 0)),
+    bestCombo: Math.max(0, Math.floor(Number(o.bestCombo) || 0)),
+    bestAccuracy: Math.max(0, Math.min(100, Math.floor(Number(o.bestAccuracy) || 0))),
+    plays: Math.max(0, Math.floor(Number(o.plays) || 0)),
+  };
+}
+
+function coerceAllStats(x: unknown): AllStats {
+  const o = (x ?? {}) as Partial<Record<Difficulty, unknown>>;
+  return {
+    easy: coerceDiffStats(o.easy),
+    normal: coerceDiffStats(o.normal),
+    hard: coerceDiffStats(o.hard),
+  };
+}
+
+/** Parse a raw cloud payload, migrating older schemas up to the current one. */
+function migrateCloudPayload(raw: string): CloudSave | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const maybeVersioned = parsed as { v?: number; stats?: unknown };
+  // v1 (legacy): the payload IS the AllStats object, no envelope.
+  if (typeof maybeVersioned.v !== "number") {
+    return { v: 2, stats: coerceAllStats(parsed) };
+  }
+  // v2: current envelope.
+  if (maybeVersioned.v === 2) {
+    return { v: 2, stats: coerceAllStats(maybeVersioned.stats) };
+  }
+  // Unknown future version — try to salvage `stats` if present, else drop.
+  if (maybeVersioned.stats && typeof maybeVersioned.stats === "object") {
+    return { v: 2, stats: coerceAllStats(maybeVersioned.stats) };
+  }
+  return null;
+}
+
+function encodeCloudPayload(stats: AllStats): string {
+  const payload: CloudSaveV2 = { v: CLOUD_SAVE_VERSION, stats };
+  return JSON.stringify(payload);
+}
 
 function loadStats(): AllStats {
   if (typeof window === "undefined") return EMPTY_STATS;
