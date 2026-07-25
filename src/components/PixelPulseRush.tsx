@@ -449,6 +449,17 @@ export default function PixelPulseRush() {
   const activeTouchesRef = useRef<Map<number, number>>(new Map());
   const mutedRef = useRef(false);
   const cloudReadyRef = useRef(false);
+  // Interstitial cooldown — YouTube requires ads only at natural breakpoints,
+  // never mid-run and never too frequently. Track last shown timestamp and
+  // whether the current run has already surfaced one.
+  const lastInterstitialAtRef = useRef(0);
+  const shownInterstitialThisRunRef = useRef(false);
+  const INTERSTITIAL_MIN_INTERVAL_MS = 90_000;
+  const [rewardGranted, setRewardGranted] = useState(false);
+  const [rewardPending, setRewardPending] = useState(false);
+
+
+
 
 
   // Load persisted stats + offset + parse challenge URL
