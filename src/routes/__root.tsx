@@ -99,8 +99,11 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
 });
 
 function RootShell({ children }: { children: ReactNode }) {
+  // The YouTube Playables SDK mutates <html>/<body> inline styles
+  // (touch-action, overscroll-behavior, user-select) client-side.
+  // suppressHydrationWarning silences the resulting mismatch warning.
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <head>
         {/*
           YouTube Playables SDK — MUST load before any game code so it can set up
@@ -110,7 +113,7 @@ function RootShell({ children }: { children: ReactNode }) {
         <script src="https://www.youtube.com/game_api/v1" async={false} />
         <HeadContent />
       </head>
-      <body>
+      <body suppressHydrationWarning>
         {children}
         <Scripts />
       </body>

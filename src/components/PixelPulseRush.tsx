@@ -60,6 +60,10 @@ const DIFFICULTIES: Record<Difficulty, DifficultyConfig> = {
 const STATS_KEY = "ppr:stats:v1";
 const OFFSET_KEY = "ppr:offset:v1";
 
+// Current cloud-save schema version. Bump when the shape of `stats` changes
+// and add a case to `migrateCloudPayload` below.
+const CLOUD_SAVE_VERSION = 2;
+
 type DiffStats = {
   bestScore: number;
   bestCombo: number;
@@ -72,6 +76,66 @@ const EMPTY_STATS: AllStats = {
   normal: { bestScore: 0, bestCombo: 0, bestAccuracy: 0, plays: 0 },
   hard: { bestScore: 0, bestCombo: 0, bestAccuracy: 0, plays: 0 },
 };
+
+/**
+ * Versioned cloud-save envelope. Older builds wrote raw AllStats without
+ * a wrapper (implicit v1). New builds always write { v, stats }.
+ * When the schema evolves, bump CLOUD_SAVE_VERSION and add a migration
+ * branch — never mutate the shape of an existing version in place.
+ */
+type CloudSaveV2 = { v: 2; stats: AllStats };
+type CloudSave = CloudSaveV2;
+
+function coerceDiffStats(x: unknown): DiffStats {
+  const o = (x ?? {}) as Partial<DiffStats>;
+  return {
+    bestScore: Math.max(0, Math.floor(Number(o.bestScore) || 0)),
+    bestCombo: Math.max(0, Math.floor(Number(o.bestCombo) || 0)),
+    bestAccuracy: Math.max(0, Math.min(100, Math.floor(Number(o.bestAccuracy) || 0))),
+    plays: Math.max(0, Math.floor(Number(o.plays) || 0)),
+  };
+}
+
+function coerceAllStats(x: unknown): AllStats {
+  const o = (x ?? {}) as Partial<Record<Difficulty, unknown>>;
+  return {
+    easy: coerceDiffStats(o.easy),
+    normal: coerceDiffStats(o.normal),
+    hard: coerceDiffStats(o.hard),
+  };
+}
+
+/** Parse a raw cloud payload, migrating older schemas up to the current one. */
+function migrateCloudPayload(raw: string): CloudSave | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const maybeVersioned = parsed as { v?: number; stats?: unknown };
+  // v1 (legacy): the payload IS the AllStats object, no envelope.
+  if (typeof maybeVersioned.v !== "number") {
+    return { v: 2, stats: coerceAllStats(parsed) };
+  }
+  // v2: current envelope.
+  if (maybeVersioned.v === 2) {
+    return { v: 2, stats: coerceAllStats(maybeVersioned.stats) };
+  }
+  // Unknown future version — try to salvage `stats` if present, else drop.
+  if (maybeVersioned.stats && typeof maybeVersioned.stats === "object") {
+    return { v: 2, stats: coerceAllStats(maybeVersioned.stats) };
+  }
+  return null;
+}
+
+function encodeCloudPayload(stats: AllStats): string {
+  const payload: CloudSaveV2 = { v: CLOUD_SAVE_VERSION, stats };
+  return JSON.stringify(payload);
+}
 
 function loadStats(): AllStats {
   if (typeof window === "undefined") return EMPTY_STATS;
@@ -385,6 +449,17 @@ export default function PixelPulseRush() {
   const activeTouchesRef = useRef<Map<number, number>>(new Map());
   const mutedRef = useRef(false);
   const cloudReadyRef = useRef(false);
+  // Interstitial cooldown — YouTube requires ads only at natural breakpoints,
+  // never mid-run and never too frequently. Track last shown timestamp and
+  // whether the current run has already surfaced one.
+  const lastInterstitialAtRef = useRef(0);
+  const shownInterstitialThisRunRef = useRef(false);
+  const INTERSTITIAL_MIN_INTERVAL_MS = 90_000;
+  const [rewardGranted, setRewardGranted] = useState(false);
+  const [rewardPending, setRewardPending] = useState(false);
+
+
+
 
 
   // Load persisted stats + offset + parse challenge URL
@@ -420,33 +495,38 @@ export default function PixelPulseRush() {
     mutedRef.current = !ytg.isAudioEnabled();
 
     // Merge any cloud save into local stats (cloud wins on higher values).
+    // Payload is versioned (see migrateCloudPayload) so older saves are
+    // upgraded transparently and unknown-future saves are salvaged if possible.
     (async () => {
       const raw = await ytg.loadCloudData();
       if (cancelled || !raw) {
         cloudReadyRef.current = true;
         return;
       }
-      try {
-        const cloud = JSON.parse(raw) as Partial<AllStats>;
-        setStatsAll((cur) => {
-          const merged: AllStats = { ...cur };
-          (Object.keys(EMPTY_STATS) as Difficulty[]).forEach((d) => {
-            const a = cur[d];
-            const b = cloud[d];
-            if (!b) return;
-            merged[d] = {
-              bestScore: Math.max(a.bestScore, b.bestScore ?? 0),
-              bestCombo: Math.max(a.bestCombo, b.bestCombo ?? 0),
-              bestAccuracy: Math.max(a.bestAccuracy, b.bestAccuracy ?? 0),
-              plays: Math.max(a.plays, b.plays ?? 0),
-            };
-          });
-          saveStats(merged);
-          return merged;
-        });
-      } catch {
-        /* corrupted cloud payload — ignore */
+      const migrated = migrateCloudPayload(raw);
+      if (!migrated) {
+        cloudReadyRef.current = true;
+        return;
       }
+      const cloud = migrated.stats;
+      setStatsAll((cur) => {
+        const merged: AllStats = { ...cur };
+        (Object.keys(EMPTY_STATS) as Difficulty[]).forEach((d) => {
+          const a = cur[d];
+          const b = cloud[d];
+          if (!b) return;
+          merged[d] = {
+            bestScore: Math.max(a.bestScore, b.bestScore ?? 0),
+            bestCombo: Math.max(a.bestCombo, b.bestCombo ?? 0),
+            bestAccuracy: Math.max(a.bestAccuracy, b.bestAccuracy ?? 0),
+            plays: Math.max(a.plays, b.plays ?? 0),
+          };
+        });
+        saveStats(merged);
+        // Rewrite cloud in the current envelope so legacy v1 saves get upgraded.
+        void ytg.saveCloudData(encodeCloudPayload(merged));
+        return merged;
+      });
       cloudReadyRef.current = true;
     })();
 
@@ -495,6 +575,16 @@ export default function PixelPulseRush() {
   }, []);
 
 
+  // Try to surface an interstitial at a natural break. Silently no-ops when
+  // outside Playables, on cooldown, or if the ad request fails.
+  const tryInterstitial = useCallback(async () => {
+    const now = Date.now();
+    if (now - lastInterstitialAtRef.current < INTERSTITIAL_MIN_INTERVAL_MS) return;
+    lastInterstitialAtRef.current = now;
+    // Fire-and-forget: any rejection is swallowed by the SDK wrapper.
+    void ytg.requestInterstitialAd();
+  }, []);
+
   const endGame = useCallback(() => {
     if (stateRef.current !== "playing" && stateRef.current !== "paused") return;
     stateRef.current = "over";
@@ -520,6 +610,8 @@ export default function PixelPulseRush() {
       newBestCombo,
     };
     setFinalStats(stats);
+    setRewardGranted(false);
+    setRewardPending(false);
 
     const next: AllStats = {
       ...statsAll,
@@ -532,9 +624,10 @@ export default function PixelPulseRush() {
     };
     setStatsAll(next);
     saveStats(next);
-    // Push best-score to YouTube leaderboards and mirror stats to cloud save.
+    // Push best-score to YouTube leaderboards and mirror stats to cloud save
+    // using the current versioned envelope.
     void ytg.sendScore(next[difficulty].bestScore);
-    void ytg.saveCloudData(JSON.stringify(next));
+    void ytg.saveCloudData(encodeCloudPayload(next));
 
 
     try {
@@ -548,7 +641,13 @@ export default function PixelPulseRush() {
     } catch {
       setShareUrl("");
     }
-  }, [difficulty, statsAll]);
+
+    // Natural break: game over. Only if we didn't already show one this run.
+    if (!shownInterstitialThisRunRef.current) {
+      shownInterstitialThisRunRef.current = true;
+      void tryInterstitial();
+    }
+  }, [difficulty, statsAll, tryInterstitial]);
 
   const startGame = useCallback(async () => {
     const cfg = DIFFICULTIES[difficulty];
@@ -567,6 +666,9 @@ export default function PixelPulseRush() {
     perfectWindowRef.current = cfg.perfectWindow;
     setHud({ score: 0, combo: 0, misses: 0, best: 0 });
     setFinalStats(null);
+    setRewardGranted(false);
+    setRewardPending(false);
+    shownInterstitialThisRunRef.current = false;
 
     // Stop any prior engine
     engineRef.current?.stop();
@@ -605,7 +707,12 @@ export default function PixelPulseRush() {
     stateRef.current = "paused";
     setState("paused");
     engineRef.current?.pause();
-  }, []);
+    // Natural break: pause is a good spot for an interstitial (rate-limited).
+    if (!shownInterstitialThisRunRef.current) {
+      shownInterstitialThisRunRef.current = true;
+      void tryInterstitial();
+    }
+  }, [tryInterstitial]);
 
   const resumeGame = useCallback(async () => {
     if (stateRef.current !== "paused") return;
@@ -908,6 +1015,57 @@ export default function PixelPulseRush() {
   const onZonePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     activeTouchesRef.current.delete(e.pointerId);
   };
+
+  // ---------- Rewarded ad (bonus points on the score card) ----------
+  const REWARD_BONUS_POINTS = 500;
+  const REWARD_ID = "score-bonus-500";
+
+  const claimRewardedBonus = useCallback(async () => {
+    if (!finalStats || rewardGranted || rewardPending) return;
+    setRewardPending(true);
+    const earned = await ytg.requestRewardedAd(REWARD_ID);
+    setRewardPending(false);
+    if (!earned) {
+      // Graceful fallback: ad failed, wasn't watched to completion, or
+      // Playables env is unavailable. Leave the button available for retry.
+      return;
+    }
+    // Apply the bonus to the final-stats card and persist a new best if beaten.
+    const bonusScore = finalStats.score + REWARD_BONUS_POINTS;
+    const updated: FinalStats = {
+      ...finalStats,
+      score: bonusScore,
+      newBestScore:
+        finalStats.newBestScore || bonusScore > statsAll[finalStats.difficulty].bestScore,
+    };
+    setFinalStats(updated);
+    setRewardGranted(true);
+
+    const prev = statsAll[updated.difficulty];
+    if (bonusScore > prev.bestScore) {
+      const next: AllStats = {
+        ...statsAll,
+        [updated.difficulty]: { ...prev, bestScore: bonusScore },
+      };
+      setStatsAll(next);
+      saveStats(next);
+      void ytg.sendScore(bonusScore);
+      void ytg.saveCloudData(encodeCloudPayload(next));
+    }
+
+    // Refresh the share URL to reflect the bonused score.
+    try {
+      const u = new URL(window.location.href);
+      u.search = "";
+      u.searchParams.set("s", String(bonusScore));
+      u.searchParams.set("c", String(updated.bestCombo));
+      u.searchParams.set("a", String(updated.accuracy));
+      u.searchParams.set("d", updated.difficulty);
+      setShareUrl(u.toString());
+    } catch {
+      /* ignore */
+    }
+  }, [finalStats, rewardGranted, rewardPending, statsAll]);
 
   // ---------- Share ----------
   const buildShareText = (fs: FinalStats) =>
@@ -1481,6 +1639,21 @@ export default function PixelPulseRush() {
                 <span className="text-glow-cyan">HITS</span>{" "}
                 {finalStats.hits}/{finalStats.total}
               </div>
+            </div>
+
+            {/* Rewarded ad: grants a one-time score bonus per game-over screen. */}
+            <div className="mb-2 w-full max-w-[260px] mx-auto">
+              <button
+                onClick={claimRewardedBonus}
+                disabled={rewardGranted || rewardPending}
+                className="w-full font-display text-[10px] px-4 py-3 rounded bg-gradient-to-r from-[var(--neon-pink)] to-[var(--neon-yellow)] text-black hover:brightness-110 disabled:opacity-60 disabled:cursor-not-allowed shadow-[0_0_20px_-2px_var(--neon-yellow)]"
+              >
+                {rewardGranted
+                  ? `✓ +${REWARD_BONUS_POINTS} BONUS APPLIED`
+                  : rewardPending
+                    ? "LOADING AD…"
+                    : `🎁 WATCH AD · +${REWARD_BONUS_POINTS} PTS`}
+              </button>
             </div>
 
             <div className="flex flex-wrap gap-2 justify-center mb-2">
