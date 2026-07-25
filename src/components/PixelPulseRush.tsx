@@ -1656,6 +1656,7 @@ export default function PixelPulseRush() {
               </button>
             </div>
 
+            <div className="flex flex-wrap gap-2 justify-center mb-2">
               <button
                 onClick={startGame}
                 className="font-display text-[10px] px-4 py-2 rounded bg-[var(--neon-pink)] text-black hover:brightness-110 shadow-[0_0_20px_-2px_var(--neon-pink)]"
