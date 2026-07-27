@@ -1273,7 +1273,7 @@ export default function PixelPulseRush() {
     } catch {
       /* ignore */
     }
-  }, [finalStats, rewardGranted, rewardPending, statsAll]);
+  }, [finalStats, rewardGranted, rewardPending, statsAll, queueCloudSave, patchDebug]);
 
   // ---------- Share ----------
   const buildShareText = (fs: FinalStats) =>
