@@ -1942,9 +1942,13 @@ export default function PixelPulseRush() {
                 </a>
               </div>
             )}
+            <AdHint hint={interstitialHint} />
           </Overlay>
         )}
+
+        <DebugOverlay open={debugOpen} info={debug} onClose={() => setDebugOpen(false)} />
       </div>
+
 
       <footer className="mt-4 text-[11px] text-muted-foreground text-center max-w-[560px]">
         Procedurally generated chiptune · Every run is a new track
