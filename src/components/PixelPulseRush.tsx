@@ -515,23 +515,11 @@ export default function PixelPulseRush() {
   //  - "unavailable": not in Playables env or SDK returned false
   //  - "shown"      : request went through (may or may not have rendered)
   //  - null         : nothing to say
-  type InterstitialHint = "cooldown" | "unavailable" | "shown" | null;
   const [interstitialHint, setInterstitialHint] = useState<InterstitialHint>(null);
 
   // ---------- Hidden debug overlay ----------
   // Toggle with backtick (`) or by appending ?debug=1 to the URL.
   const [debugOpen, setDebugOpen] = useState(false);
-  type DebugInfo = {
-    cloudSchemaVersion: number;
-    cloudSourceVersion: number | null;
-    cloudMigrationStatus: MigrationStatus | "pending";
-    inPlayables: boolean;
-    lastAd: { kind: "interstitial" | "rewarded"; result: string; at: number } | null;
-    lastSave: { ok: boolean; note: string; at: number } | null;
-    saveQueueDepth: number;
-    saveQueueAttempts: number;
-    lastError: string | null;
-  };
   const [debug, setDebug] = useState<DebugInfo>(() => ({
     cloudSchemaVersion: CLOUD_SAVE_VERSION,
     cloudSourceVersion: null,
