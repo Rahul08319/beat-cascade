@@ -867,6 +867,7 @@ export default function PixelPulseRush() {
     setRewardGranted(false);
     setRewardPending(false);
     shownInterstitialThisRunRef.current = false;
+    setInterstitialHint(null);
 
     // Stop any prior engine
     engineRef.current?.stop();
