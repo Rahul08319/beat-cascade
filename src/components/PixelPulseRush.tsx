@@ -1221,8 +1221,17 @@ export default function PixelPulseRush() {
   const claimRewardedBonus = useCallback(async () => {
     if (!finalStats || rewardGranted || rewardPending) return;
     setRewardPending(true);
+    const startedAt = Date.now();
     const earned = await ytg.requestRewardedAd(REWARD_ID);
     setRewardPending(false);
+    patchDebug({
+      lastAd: {
+        kind: "rewarded",
+        result: earned ? "reward granted" : "not earned/unavailable",
+        at: Date.now() - startedAt >= 0 ? Date.now() : startedAt,
+      },
+      ...(earned ? {} : { lastError: "rewarded ad not earned" }),
+    });
     if (!earned) {
       // Graceful fallback: ad failed, wasn't watched to completion, or
       // Playables env is unavailable. Leave the button available for retry.
@@ -1248,8 +1257,9 @@ export default function PixelPulseRush() {
       setStatsAll(next);
       saveStats(next);
       void ytg.sendScore(bonusScore);
-      void ytg.saveCloudData(encodeCloudPayload(next));
+      void queueCloudSave(encodeCloudPayload(next));
     }
+
 
     // Refresh the share URL to reflect the bonused score.
     try {
