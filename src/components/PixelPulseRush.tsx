@@ -845,7 +845,7 @@ export default function PixelPulseRush() {
       shownInterstitialThisRunRef.current = true;
       void tryInterstitial();
     }
-  }, [difficulty, statsAll, tryInterstitial]);
+  }, [difficulty, statsAll, tryInterstitial, queueCloudSave]);
 
   const startGame = useCallback(async () => {
     const cfg = DIFFICULTIES[difficulty];
