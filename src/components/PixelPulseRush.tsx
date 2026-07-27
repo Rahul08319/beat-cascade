@@ -105,36 +105,102 @@ function coerceAllStats(x: unknown): AllStats {
   };
 }
 
+type InterstitialHint = "cooldown" | "unavailable" | "shown" | null;
+
+type DebugInfo = {
+  cloudSchemaVersion: number;
+  cloudSourceVersion: number | null;
+  cloudMigrationStatus: MigrationStatus | "pending";
+  inPlayables: boolean;
+  lastAd: { kind: "interstitial" | "rewarded"; result: string; at: number } | null;
+  lastSave: { ok: boolean; note: string; at: number } | null;
+  saveQueueDepth: number;
+  saveQueueAttempts: number;
+  lastError: string | null;
+};
+
+type MigrationStatus =
+  | "empty"
+  | "loaded_v2"
+  | "migrated_from_v1"
+  | "salvaged_unknown"
+  | "invalid_json"
+  | "wrong_shape";
+
 /** Parse a raw cloud payload, migrating older schemas up to the current one. */
-function migrateCloudPayload(raw: string): CloudSave | null {
-  if (!raw) return null;
+function migrateCloudPayload(
+  raw: string,
+): { save: CloudSave | null; status: MigrationStatus; sourceVersion: number | null } {
+  if (!raw) return { save: null, status: "empty", sourceVersion: null };
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null;
+    return { save: null, status: "invalid_json", sourceVersion: null };
   }
-  if (!parsed || typeof parsed !== "object") return null;
+  if (!parsed || typeof parsed !== "object")
+    return { save: null, status: "wrong_shape", sourceVersion: null };
 
   const maybeVersioned = parsed as { v?: number; stats?: unknown };
   // v1 (legacy): the payload IS the AllStats object, no envelope.
   if (typeof maybeVersioned.v !== "number") {
-    return { v: 2, stats: coerceAllStats(parsed) };
+    return {
+      save: { v: 2, stats: coerceAllStats(parsed) },
+      status: "migrated_from_v1",
+      sourceVersion: 1,
+    };
   }
-  // v2: current envelope.
   if (maybeVersioned.v === 2) {
-    return { v: 2, stats: coerceAllStats(maybeVersioned.stats) };
+    return {
+      save: { v: 2, stats: coerceAllStats(maybeVersioned.stats) },
+      status: "loaded_v2",
+      sourceVersion: 2,
+    };
   }
   // Unknown future version — try to salvage `stats` if present, else drop.
   if (maybeVersioned.stats && typeof maybeVersioned.stats === "object") {
-    return { v: 2, stats: coerceAllStats(maybeVersioned.stats) };
+    return {
+      save: { v: 2, stats: coerceAllStats(maybeVersioned.stats) },
+      status: "salvaged_unknown",
+      sourceVersion: maybeVersioned.v,
+    };
   }
-  return null;
+  return { save: null, status: "wrong_shape", sourceVersion: maybeVersioned.v };
 }
 
 function encodeCloudPayload(stats: AllStats): string {
   const payload: CloudSaveV2 = { v: CLOUD_SAVE_VERSION, stats };
   return JSON.stringify(payload);
+}
+
+// ---------- Cloud save retry queue ----------
+// When a saveData call fails (rate-limit / transient / offline) we keep the
+// payload queued in localStorage and retry it: on interval, on `online`, and
+// after any subsequent successful save. Only the newest payload is kept —
+// intermediate stats are strictly older and safe to drop.
+const CLOUD_QUEUE_KEY = "ppr:cloudq:v1";
+
+type QueuedSave = { payload: string; queuedAt: number; attempts: number };
+
+function readQueue(): QueuedSave | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(CLOUD_QUEUE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as QueuedSave;
+    if (!parsed || typeof parsed.payload !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function writeQueue(q: QueuedSave | null) {
+  try {
+    if (!q) localStorage.removeItem(CLOUD_QUEUE_KEY);
+    else localStorage.setItem(CLOUD_QUEUE_KEY, JSON.stringify(q));
+  } catch {
+    /* ignore */
+  }
 }
 
 function loadStats(): AllStats {
@@ -458,8 +524,116 @@ export default function PixelPulseRush() {
   const [rewardGranted, setRewardGranted] = useState(false);
   const [rewardPending, setRewardPending] = useState(false);
 
+  // Interstitial availability hint for the current pause/game-over screen.
+  //  - "cooldown"   : rate-limited by our INTERSTITIAL_MIN_INTERVAL_MS
+  //  - "unavailable": not in Playables env or SDK returned false
+  //  - "shown"      : request went through (may or may not have rendered)
+  //  - null         : nothing to say
+  const [interstitialHint, setInterstitialHint] = useState<InterstitialHint>(null);
 
+  // ---------- Hidden debug overlay ----------
+  // Toggle with backtick (`) or by appending ?debug=1 to the URL.
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [debug, setDebug] = useState<DebugInfo>(() => ({
+    cloudSchemaVersion: CLOUD_SAVE_VERSION,
+    cloudSourceVersion: null,
+    cloudMigrationStatus: "pending",
+    inPlayables: false,
+    lastAd: null,
+    lastSave: null,
+    saveQueueDepth: 0,
+    saveQueueAttempts: 0,
+    lastError: null,
+  }));
+  const patchDebug = useCallback((p: Partial<DebugInfo>) => {
+    setDebug((d) => ({ ...d, ...p }));
+  }, []);
+  // ---------- Queued cloud save with retry ----------
+  // Only the newest payload is kept; older stats are strictly obsolete once
+  // a more recent snapshot exists locally. flushCloudQueue is called from
+  // queueCloudSave, from an interval, from `online`, and from tab visibility.
+  const flushingRef = useRef(false);
+  const flushCloudQueue = useCallback(async () => {
+    if (flushingRef.current) return;
+    const q = readQueue();
+    if (!q) return;
+    flushingRef.current = true;
+    const res = await ytg.saveCloudDataStrict(q.payload);
+    flushingRef.current = false;
+    if (res.ok) {
+      writeQueue(null);
+      patchDebug({
+        lastSave: {
+          ok: true,
+          note: res.noop ? "noop (outside Playables)" : "flushed",
+          at: Date.now(),
+        },
+        saveQueueDepth: 0,
+      });
+    } else {
+      const bumped: QueuedSave = { ...q, attempts: q.attempts + 1 };
+      writeQueue(bumped);
+      patchDebug({
+        lastSave: { ok: false, note: `retry ${bumped.attempts}: ${res.error ?? "err"}`, at: Date.now() },
+        saveQueueDepth: 1,
+        saveQueueAttempts: bumped.attempts,
+        lastError: res.error ?? "save failed",
+      });
+    }
+  }, [patchDebug]);
 
+  const queueCloudSave = useCallback(
+    async (payload: string) => {
+      // Newest wins — overwrite any queued payload with fresher stats.
+      writeQueue({ payload, queuedAt: Date.now(), attempts: 0 });
+      patchDebug({ saveQueueDepth: 1 });
+      await flushCloudQueue();
+    },
+    [flushCloudQueue, patchDebug],
+  );
+
+  // Retry loop for queued saves: interval + network + visibility triggers.
+  useEffect(() => {
+    // Adopt any queue from a previous session.
+    const existing = readQueue();
+    if (existing) {
+      patchDebug({ saveQueueDepth: 1, saveQueueAttempts: existing.attempts });
+      void flushCloudQueue();
+    }
+    const t = window.setInterval(() => {
+      void flushCloudQueue();
+    }, 15_000);
+    const onOnline = () => void flushCloudQueue();
+    const onVis = () => {
+      if (!document.hidden) void flushCloudQueue();
+    };
+    window.addEventListener("online", onOnline);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(t);
+      window.removeEventListener("online", onOnline);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [flushCloudQueue, patchDebug]);
+
+  // Debug overlay toggle: backtick key or ?debug=1 URL flag.
+  useEffect(() => {
+    try {
+      if (new URLSearchParams(window.location.search).get("debug") === "1") {
+        setDebugOpen(true);
+      }
+    } catch {
+      /* ignore */
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "`" || e.key === "~") {
+        e.preventDefault();
+        setDebugOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
 
   // Load persisted stats + offset + parse challenge URL
@@ -493,17 +667,19 @@ export default function PixelPulseRush() {
 
     // Initial audio state from YT settings.
     mutedRef.current = !ytg.isAudioEnabled();
+    patchDebug({ inPlayables: ytg.inPlayablesEnv() });
 
     // Merge any cloud save into local stats (cloud wins on higher values).
     // Payload is versioned (see migrateCloudPayload) so older saves are
     // upgraded transparently and unknown-future saves are salvaged if possible.
     (async () => {
       const raw = await ytg.loadCloudData();
-      if (cancelled || !raw) {
+      if (cancelled) {
         cloudReadyRef.current = true;
         return;
       }
-      const migrated = migrateCloudPayload(raw);
+      const { save: migrated, status, sourceVersion } = migrateCloudPayload(raw);
+      patchDebug({ cloudMigrationStatus: status, cloudSourceVersion: sourceVersion });
       if (!migrated) {
         cloudReadyRef.current = true;
         return;
@@ -524,11 +700,12 @@ export default function PixelPulseRush() {
         });
         saveStats(merged);
         // Rewrite cloud in the current envelope so legacy v1 saves get upgraded.
-        void ytg.saveCloudData(encodeCloudPayload(merged));
+        void queueCloudSave(encodeCloudPayload(merged));
         return merged;
       });
       cloudReadyRef.current = true;
     })();
+
 
     // Signal SDK milestones. firstFrameReady after paint, gameReady when interactable.
     const raf = requestAnimationFrame(() => {
@@ -575,15 +752,38 @@ export default function PixelPulseRush() {
   }, []);
 
 
-  // Try to surface an interstitial at a natural break. Silently no-ops when
-  // outside Playables, on cooldown, or if the ad request fails.
+  // Try to surface an interstitial at a natural break. Sets a UI hint so the
+  // player knows whether an ad was actually requested, deferred by cooldown,
+  // or unavailable in this environment.
   const tryInterstitial = useCallback(async () => {
     const now = Date.now();
-    if (now - lastInterstitialAtRef.current < INTERSTITIAL_MIN_INTERVAL_MS) return;
+    if (now - lastInterstitialAtRef.current < INTERSTITIAL_MIN_INTERVAL_MS) {
+      setInterstitialHint("cooldown");
+      patchDebug({
+        lastAd: { kind: "interstitial", result: "skipped: cooldown", at: now },
+      });
+      return;
+    }
+    if (!ytg.inPlayablesEnv()) {
+      setInterstitialHint("unavailable");
+      patchDebug({
+        lastAd: { kind: "interstitial", result: "skipped: not in Playables", at: now },
+      });
+      return;
+    }
     lastInterstitialAtRef.current = now;
-    // Fire-and-forget: any rejection is swallowed by the SDK wrapper.
-    void ytg.requestInterstitialAd();
-  }, []);
+    const ok = await ytg.requestInterstitialAd();
+    setInterstitialHint(ok ? "shown" : "unavailable");
+    patchDebug({
+      lastAd: {
+        kind: "interstitial",
+        result: ok ? "requested" : "failed/unavailable",
+        at: Date.now(),
+      },
+      ...(ok ? {} : { lastError: "interstitial request failed" }),
+    });
+  }, [patchDebug]);
+
 
   const endGame = useCallback(() => {
     if (stateRef.current !== "playing" && stateRef.current !== "paused") return;
@@ -625,9 +825,9 @@ export default function PixelPulseRush() {
     setStatsAll(next);
     saveStats(next);
     // Push best-score to YouTube leaderboards and mirror stats to cloud save
-    // using the current versioned envelope.
+    // (queued + retried on transient failure) using the current envelope.
     void ytg.sendScore(next[difficulty].bestScore);
-    void ytg.saveCloudData(encodeCloudPayload(next));
+    void queueCloudSave(encodeCloudPayload(next));
 
 
     try {
@@ -647,7 +847,7 @@ export default function PixelPulseRush() {
       shownInterstitialThisRunRef.current = true;
       void tryInterstitial();
     }
-  }, [difficulty, statsAll, tryInterstitial]);
+  }, [difficulty, statsAll, tryInterstitial, queueCloudSave]);
 
   const startGame = useCallback(async () => {
     const cfg = DIFFICULTIES[difficulty];
@@ -669,6 +869,7 @@ export default function PixelPulseRush() {
     setRewardGranted(false);
     setRewardPending(false);
     shownInterstitialThisRunRef.current = false;
+    setInterstitialHint(null);
 
     // Stop any prior engine
     engineRef.current?.stop();
@@ -1023,8 +1224,17 @@ export default function PixelPulseRush() {
   const claimRewardedBonus = useCallback(async () => {
     if (!finalStats || rewardGranted || rewardPending) return;
     setRewardPending(true);
+    const startedAt = Date.now();
     const earned = await ytg.requestRewardedAd(REWARD_ID);
     setRewardPending(false);
+    patchDebug({
+      lastAd: {
+        kind: "rewarded",
+        result: earned ? "reward granted" : "not earned/unavailable",
+        at: Date.now() - startedAt >= 0 ? Date.now() : startedAt,
+      },
+      ...(earned ? {} : { lastError: "rewarded ad not earned" }),
+    });
     if (!earned) {
       // Graceful fallback: ad failed, wasn't watched to completion, or
       // Playables env is unavailable. Leave the button available for retry.
@@ -1050,8 +1260,9 @@ export default function PixelPulseRush() {
       setStatsAll(next);
       saveStats(next);
       void ytg.sendScore(bonusScore);
-      void ytg.saveCloudData(encodeCloudPayload(next));
+      void queueCloudSave(encodeCloudPayload(next));
     }
+
 
     // Refresh the share URL to reflect the bonused score.
     try {
@@ -1065,7 +1276,7 @@ export default function PixelPulseRush() {
     } catch {
       /* ignore */
     }
-  }, [finalStats, rewardGranted, rewardPending, statsAll]);
+  }, [finalStats, rewardGranted, rewardPending, statsAll, queueCloudSave, patchDebug]);
 
   // ---------- Share ----------
   const buildShareText = (fs: FinalStats) =>
@@ -1558,8 +1769,10 @@ export default function PixelPulseRush() {
                 QUIT
               </button>
             </div>
+            <AdHint hint={interstitialHint} />
           </Overlay>
         )}
+
 
         {state === "calibrating" && calProgress && (
           <div
@@ -1731,9 +1944,13 @@ export default function PixelPulseRush() {
                 </a>
               </div>
             )}
+            <AdHint hint={interstitialHint} />
           </Overlay>
         )}
+
+        <DebugOverlay open={debugOpen} info={debug} onClose={() => setDebugOpen(false)} />
       </div>
+
 
       <footer className="mt-4 text-[11px] text-muted-foreground text-center max-w-[560px]">
         Procedurally generated chiptune · Every run is a new track
@@ -1746,6 +1963,104 @@ function Overlay({ children }: { children: React.ReactNode }) {
   return (
     <div className="absolute inset-0 flex flex-col items-center justify-center text-center bg-black/60 backdrop-blur-sm px-4 z-10 overflow-y-auto py-6">
       {children}
+    </div>
+  );
+}
+
+/**
+ * Small non-disruptive line explaining ad state on pause/game-over.
+ * Always renders (fixed height) so the button layout doesn't shift.
+ */
+function AdHint({ hint }: { hint: InterstitialHint }) {
+  const text =
+    hint === "cooldown"
+      ? "ad on cooldown — next break eligible in ~90s"
+      : hint === "unavailable"
+        ? "no ad available right now"
+        : hint === "shown"
+          ? "ad requested"
+          : "";
+  return (
+    <div className="mt-3 min-h-[14px] text-[9px] font-mono tracking-wide text-white/50">
+      {text}
+    </div>
+  );
+}
+
+/**
+ * Hidden diagnostics panel — toggle with backtick (`) or ?debug=1.
+ * Non-blocking (pointer-events-none body) so it never intercepts gameplay taps.
+ * Renders cloud payload version, migration status, ad request results, save
+ * queue depth, and the last error we saw.
+ */
+function DebugOverlay({
+  open,
+  info,
+  onClose,
+}: {
+  open: boolean;
+  info: DebugInfo;
+  onClose: () => void;
+}) {
+  if (!open) return null;
+  const fmt = (t: number) =>
+    t ? new Date(t).toLocaleTimeString(undefined, { hour12: false }) : "—";
+  return (
+    <div className="pointer-events-none absolute top-2 right-2 z-30 max-w-[280px] text-[10px] font-mono leading-tight">
+      <div className="pointer-events-auto rounded border border-[var(--neon-cyan)]/60 bg-black/85 p-2 text-white/85 shadow-[0_0_18px_-4px_var(--neon-cyan)]">
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-glow-cyan font-display text-[9px]">DEBUG</span>
+          <button
+            onClick={onClose}
+            className="text-white/60 hover:text-white text-[10px] px-1"
+            aria-label="Close debug overlay"
+          >
+            ×
+          </button>
+        </div>
+        <div>
+          cloud v: <span className="text-glow-yellow">{info.cloudSchemaVersion}</span>
+          {" · src: "}
+          <span className="text-glow-yellow">{info.cloudSourceVersion ?? "—"}</span>
+        </div>
+        <div>
+          migration: <span className="text-glow-pink">{info.cloudMigrationStatus}</span>
+        </div>
+        <div>
+          playables env:{" "}
+          <span className={info.inPlayables ? "text-glow-cyan" : "text-white/50"}>
+            {info.inPlayables ? "yes" : "no"}
+          </span>
+        </div>
+        <div className="mt-1 border-t border-white/10 pt-1">
+          last ad:{" "}
+          {info.lastAd ? (
+            <span>
+              <span className="text-glow-cyan">{info.lastAd.kind}</span>{" "}
+              {info.lastAd.result} · {fmt(info.lastAd.at)}
+            </span>
+          ) : (
+            "—"
+          )}
+        </div>
+        <div>
+          last save:{" "}
+          {info.lastSave ? (
+            <span className={info.lastSave.ok ? "text-glow-cyan" : "text-glow-pink"}>
+              {info.lastSave.ok ? "ok" : "fail"} · {info.lastSave.note} · {fmt(info.lastSave.at)}
+            </span>
+          ) : (
+            "—"
+          )}
+        </div>
+        <div>
+          queue: {info.saveQueueDepth} · attempts: {info.saveQueueAttempts}
+        </div>
+        <div className="mt-1 border-t border-white/10 pt-1 text-glow-pink break-words">
+          err: {info.lastError ?? "—"}
+        </div>
+        <div className="mt-1 text-[9px] text-white/40">` toggles · ?debug=1</div>
+      </div>
     </div>
   );
 }

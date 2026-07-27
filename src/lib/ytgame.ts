@@ -112,6 +112,24 @@ export async function saveCloudData(data: string): Promise<void> {
   }
 }
 
+/**
+ * Strict variant of saveCloudData that surfaces success/failure so callers
+ * can implement a retry queue. Outside Playables it resolves { ok: true }
+ * (nothing to persist remotely; localStorage already holds the data).
+ */
+export async function saveCloudDataStrict(
+  data: string,
+): Promise<{ ok: boolean; error?: string; noop?: boolean }> {
+  const g = yt();
+  if (!g) return { ok: true, noop: true };
+  try {
+    await g.game.saveData(data);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 /** Reports a best/current score to YouTube. */
 export async function sendScore(value: number): Promise<void> {
   const g = yt();
