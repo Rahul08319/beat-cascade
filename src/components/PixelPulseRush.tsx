@@ -750,15 +750,38 @@ export default function PixelPulseRush() {
   }, []);
 
 
-  // Try to surface an interstitial at a natural break. Silently no-ops when
-  // outside Playables, on cooldown, or if the ad request fails.
+  // Try to surface an interstitial at a natural break. Sets a UI hint so the
+  // player knows whether an ad was actually requested, deferred by cooldown,
+  // or unavailable in this environment.
   const tryInterstitial = useCallback(async () => {
     const now = Date.now();
-    if (now - lastInterstitialAtRef.current < INTERSTITIAL_MIN_INTERVAL_MS) return;
+    if (now - lastInterstitialAtRef.current < INTERSTITIAL_MIN_INTERVAL_MS) {
+      setInterstitialHint("cooldown");
+      patchDebug({
+        lastAd: { kind: "interstitial", result: "skipped: cooldown", at: now },
+      });
+      return;
+    }
+    if (!ytg.inPlayablesEnv()) {
+      setInterstitialHint("unavailable");
+      patchDebug({
+        lastAd: { kind: "interstitial", result: "skipped: not in Playables", at: now },
+      });
+      return;
+    }
     lastInterstitialAtRef.current = now;
-    // Fire-and-forget: any rejection is swallowed by the SDK wrapper.
-    void ytg.requestInterstitialAd();
-  }, []);
+    const ok = await ytg.requestInterstitialAd();
+    setInterstitialHint(ok ? "shown" : "unavailable");
+    patchDebug({
+      lastAd: {
+        kind: "interstitial",
+        result: ok ? "requested" : "failed/unavailable",
+        at: Date.now(),
+      },
+      ...(ok ? {} : { lastError: "interstitial request failed" }),
+    });
+  }, [patchDebug]);
+
 
   const endGame = useCallback(() => {
     if (stateRef.current !== "playing" && stateRef.current !== "paused") return;
