@@ -584,17 +584,19 @@ export default function PixelPulseRush() {
 
     // Initial audio state from YT settings.
     mutedRef.current = !ytg.isAudioEnabled();
+    patchDebug({ inPlayables: ytg.inPlayablesEnv() });
 
     // Merge any cloud save into local stats (cloud wins on higher values).
     // Payload is versioned (see migrateCloudPayload) so older saves are
     // upgraded transparently and unknown-future saves are salvaged if possible.
     (async () => {
       const raw = await ytg.loadCloudData();
-      if (cancelled || !raw) {
+      if (cancelled) {
         cloudReadyRef.current = true;
         return;
       }
-      const migrated = migrateCloudPayload(raw);
+      const { save: migrated, status, sourceVersion } = migrateCloudPayload(raw);
+      patchDebug({ cloudMigrationStatus: status, cloudSourceVersion: sourceVersion });
       if (!migrated) {
         cloudReadyRef.current = true;
         return;
@@ -615,11 +617,12 @@ export default function PixelPulseRush() {
         });
         saveStats(merged);
         // Rewrite cloud in the current envelope so legacy v1 saves get upgraded.
-        void ytg.saveCloudData(encodeCloudPayload(merged));
+        void queueCloudSave(encodeCloudPayload(merged));
         return merged;
       });
       cloudReadyRef.current = true;
     })();
+
 
     // Signal SDK milestones. firstFrameReady after paint, gameReady when interactable.
     const raf = requestAnimationFrame(() => {
