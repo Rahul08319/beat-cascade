@@ -1767,8 +1767,10 @@ export default function PixelPulseRush() {
                 QUIT
               </button>
             </div>
+            <InterstitialHint hint={interstitialHint} />
           </Overlay>
         )}
+
 
         {state === "calibrating" && calProgress && (
           <div
