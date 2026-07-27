@@ -105,6 +105,8 @@ function coerceAllStats(x: unknown): AllStats {
   };
 }
 
+type InterstitialHint = "cooldown" | "unavailable" | "shown" | null;
+
 type MigrationStatus =
   | "empty"
   | "loaded_v2"
