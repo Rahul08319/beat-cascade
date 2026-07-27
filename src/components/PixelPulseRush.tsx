@@ -823,9 +823,9 @@ export default function PixelPulseRush() {
     setStatsAll(next);
     saveStats(next);
     // Push best-score to YouTube leaderboards and mirror stats to cloud save
-    // using the current versioned envelope.
+    // (queued + retried on transient failure) using the current envelope.
     void ytg.sendScore(next[difficulty].bestScore);
-    void ytg.saveCloudData(encodeCloudPayload(next));
+    void queueCloudSave(encodeCloudPayload(next));
 
 
     try {
