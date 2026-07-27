@@ -107,6 +107,18 @@ function coerceAllStats(x: unknown): AllStats {
 
 type InterstitialHint = "cooldown" | "unavailable" | "shown" | null;
 
+type DebugInfo = {
+  cloudSchemaVersion: number;
+  cloudSourceVersion: number | null;
+  cloudMigrationStatus: MigrationStatus | "pending";
+  inPlayables: boolean;
+  lastAd: { kind: "interstitial" | "rewarded"; result: string; at: number } | null;
+  lastSave: { ok: boolean; note: string; at: number } | null;
+  saveQueueDepth: number;
+  saveQueueAttempts: number;
+  lastError: string | null;
+};
+
 type MigrationStatus =
   | "empty"
   | "loaded_v2"
