@@ -1966,3 +1966,101 @@ function Overlay({ children }: { children: React.ReactNode }) {
     </div>
   );
 }
+
+/**
+ * Small non-disruptive line explaining ad state on pause/game-over.
+ * Always renders (fixed height) so the button layout doesn't shift.
+ */
+function AdHint({ hint }: { hint: InterstitialHint }) {
+  const text =
+    hint === "cooldown"
+      ? "ad on cooldown — next break eligible in ~90s"
+      : hint === "unavailable"
+        ? "no ad available right now"
+        : hint === "shown"
+          ? "ad requested"
+          : "";
+  return (
+    <div className="mt-3 min-h-[14px] text-[9px] font-mono tracking-wide text-white/50">
+      {text}
+    </div>
+  );
+}
+
+/**
+ * Hidden diagnostics panel — toggle with backtick (`) or ?debug=1.
+ * Non-blocking (pointer-events-none body) so it never intercepts gameplay taps.
+ * Renders cloud payload version, migration status, ad request results, save
+ * queue depth, and the last error we saw.
+ */
+function DebugOverlay({
+  open,
+  info,
+  onClose,
+}: {
+  open: boolean;
+  info: DebugInfo;
+  onClose: () => void;
+}) {
+  if (!open) return null;
+  const fmt = (t: number) =>
+    t ? new Date(t).toLocaleTimeString(undefined, { hour12: false }) : "—";
+  return (
+    <div className="pointer-events-none absolute top-2 right-2 z-30 max-w-[280px] text-[10px] font-mono leading-tight">
+      <div className="pointer-events-auto rounded border border-[var(--neon-cyan)]/60 bg-black/85 p-2 text-white/85 shadow-[0_0_18px_-4px_var(--neon-cyan)]">
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-glow-cyan font-display text-[9px]">DEBUG</span>
+          <button
+            onClick={onClose}
+            className="text-white/60 hover:text-white text-[10px] px-1"
+            aria-label="Close debug overlay"
+          >
+            ×
+          </button>
+        </div>
+        <div>
+          cloud v: <span className="text-glow-yellow">{info.cloudSchemaVersion}</span>
+          {" · src: "}
+          <span className="text-glow-yellow">{info.cloudSourceVersion ?? "—"}</span>
+        </div>
+        <div>
+          migration: <span className="text-glow-pink">{info.cloudMigrationStatus}</span>
+        </div>
+        <div>
+          playables env:{" "}
+          <span className={info.inPlayables ? "text-glow-cyan" : "text-white/50"}>
+            {info.inPlayables ? "yes" : "no"}
+          </span>
+        </div>
+        <div className="mt-1 border-t border-white/10 pt-1">
+          last ad:{" "}
+          {info.lastAd ? (
+            <span>
+              <span className="text-glow-cyan">{info.lastAd.kind}</span>{" "}
+              {info.lastAd.result} · {fmt(info.lastAd.at)}
+            </span>
+          ) : (
+            "—"
+          )}
+        </div>
+        <div>
+          last save:{" "}
+          {info.lastSave ? (
+            <span className={info.lastSave.ok ? "text-glow-cyan" : "text-glow-pink"}>
+              {info.lastSave.ok ? "ok" : "fail"} · {info.lastSave.note} · {fmt(info.lastSave.at)}
+            </span>
+          ) : (
+            "—"
+          )}
+        </div>
+        <div>
+          queue: {info.saveQueueDepth} · attempts: {info.saveQueueAttempts}
+        </div>
+        <div className="mt-1 border-t border-white/10 pt-1 text-glow-pink break-words">
+          err: {info.lastError ?? "—"}
+        </div>
+        <div className="mt-1 text-[9px] text-white/40">` toggles · ?debug=1</div>
+      </div>
+    </div>
+  );
+}
