@@ -546,11 +546,92 @@ export default function PixelPulseRush() {
   const patchDebug = useCallback((p: Partial<DebugInfo>) => {
     setDebug((d) => ({ ...d, ...p }));
   }, []);
+  // ---------- Queued cloud save with retry ----------
+  // Only the newest payload is kept; older stats are strictly obsolete once
+  // a more recent snapshot exists locally. flushCloudQueue is called from
+  // queueCloudSave, from an interval, from `online`, and from tab visibility.
+  const flushingRef = useRef(false);
+  const flushCloudQueue = useCallback(async () => {
+    if (flushingRef.current) return;
+    const q = readQueue();
+    if (!q) return;
+    flushingRef.current = true;
+    const res = await ytg.saveCloudDataStrict(q.payload);
+    flushingRef.current = false;
+    if (res.ok) {
+      writeQueue(null);
+      patchDebug({
+        lastSave: {
+          ok: true,
+          note: res.noop ? "noop (outside Playables)" : "flushed",
+          at: Date.now(),
+        },
+        saveQueueDepth: 0,
+      });
+    } else {
+      const bumped: QueuedSave = { ...q, attempts: q.attempts + 1 };
+      writeQueue(bumped);
+      patchDebug({
+        lastSave: { ok: false, note: `retry ${bumped.attempts}: ${res.error ?? "err"}`, at: Date.now() },
+        saveQueueDepth: 1,
+        saveQueueAttempts: bumped.attempts,
+        lastError: res.error ?? "save failed",
+      });
+    }
+  }, [patchDebug]);
 
+  const queueCloudSave = useCallback(
+    async (payload: string) => {
+      // Newest wins — overwrite any queued payload with fresher stats.
+      writeQueue({ payload, queuedAt: Date.now(), attempts: 0 });
+      patchDebug({ saveQueueDepth: 1 });
+      await flushCloudQueue();
+    },
+    [flushCloudQueue, patchDebug],
+  );
 
+  // Retry loop for queued saves: interval + network + visibility triggers.
+  useEffect(() => {
+    // Adopt any queue from a previous session.
+    const existing = readQueue();
+    if (existing) {
+      patchDebug({ saveQueueDepth: 1, saveQueueAttempts: existing.attempts });
+      void flushCloudQueue();
+    }
+    const t = window.setInterval(() => {
+      void flushCloudQueue();
+    }, 15_000);
+    const onOnline = () => void flushCloudQueue();
+    const onVis = () => {
+      if (!document.hidden) void flushCloudQueue();
+    };
+    window.addEventListener("online", onOnline);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(t);
+      window.removeEventListener("online", onOnline);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [flushCloudQueue, patchDebug]);
 
-
-
+  // Debug overlay toggle: backtick key or ?debug=1 URL flag.
+  useEffect(() => {
+    try {
+      if (new URLSearchParams(window.location.search).get("debug") === "1") {
+        setDebugOpen(true);
+      }
+    } catch {
+      /* ignore */
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "`" || e.key === "~") {
+        e.preventDefault();
+        setDebugOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
 
   // Load persisted stats + offset + parse challenge URL
