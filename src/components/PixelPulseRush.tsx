@@ -105,36 +105,88 @@ function coerceAllStats(x: unknown): AllStats {
   };
 }
 
+type MigrationStatus =
+  | "empty"
+  | "loaded_v2"
+  | "migrated_from_v1"
+  | "salvaged_unknown"
+  | "invalid_json"
+  | "wrong_shape";
+
 /** Parse a raw cloud payload, migrating older schemas up to the current one. */
-function migrateCloudPayload(raw: string): CloudSave | null {
-  if (!raw) return null;
+function migrateCloudPayload(
+  raw: string,
+): { save: CloudSave | null; status: MigrationStatus; sourceVersion: number | null } {
+  if (!raw) return { save: null, status: "empty", sourceVersion: null };
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null;
+    return { save: null, status: "invalid_json", sourceVersion: null };
   }
-  if (!parsed || typeof parsed !== "object") return null;
+  if (!parsed || typeof parsed !== "object")
+    return { save: null, status: "wrong_shape", sourceVersion: null };
 
   const maybeVersioned = parsed as { v?: number; stats?: unknown };
   // v1 (legacy): the payload IS the AllStats object, no envelope.
   if (typeof maybeVersioned.v !== "number") {
-    return { v: 2, stats: coerceAllStats(parsed) };
+    return {
+      save: { v: 2, stats: coerceAllStats(parsed) },
+      status: "migrated_from_v1",
+      sourceVersion: 1,
+    };
   }
-  // v2: current envelope.
   if (maybeVersioned.v === 2) {
-    return { v: 2, stats: coerceAllStats(maybeVersioned.stats) };
+    return {
+      save: { v: 2, stats: coerceAllStats(maybeVersioned.stats) },
+      status: "loaded_v2",
+      sourceVersion: 2,
+    };
   }
   // Unknown future version — try to salvage `stats` if present, else drop.
   if (maybeVersioned.stats && typeof maybeVersioned.stats === "object") {
-    return { v: 2, stats: coerceAllStats(maybeVersioned.stats) };
+    return {
+      save: { v: 2, stats: coerceAllStats(maybeVersioned.stats) },
+      status: "salvaged_unknown",
+      sourceVersion: maybeVersioned.v,
+    };
   }
-  return null;
+  return { save: null, status: "wrong_shape", sourceVersion: maybeVersioned.v };
 }
 
 function encodeCloudPayload(stats: AllStats): string {
   const payload: CloudSaveV2 = { v: CLOUD_SAVE_VERSION, stats };
   return JSON.stringify(payload);
+}
+
+// ---------- Cloud save retry queue ----------
+// When a saveData call fails (rate-limit / transient / offline) we keep the
+// payload queued in localStorage and retry it: on interval, on `online`, and
+// after any subsequent successful save. Only the newest payload is kept —
+// intermediate stats are strictly older and safe to drop.
+const CLOUD_QUEUE_KEY = "ppr:cloudq:v1";
+
+type QueuedSave = { payload: string; queuedAt: number; attempts: number };
+
+function readQueue(): QueuedSave | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(CLOUD_QUEUE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as QueuedSave;
+    if (!parsed || typeof parsed.payload !== "string") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function writeQueue(q: QueuedSave | null) {
+  try {
+    if (!q) localStorage.removeItem(CLOUD_QUEUE_KEY);
+    else localStorage.setItem(CLOUD_QUEUE_KEY, JSON.stringify(q));
+  } catch {
+    /* ignore */
+  }
 }
 
 function loadStats(): AllStats {
