@@ -579,6 +579,11 @@ export default function PixelPulseRush() {
   //  - null         : nothing to say
   const [interstitialHint, setInterstitialHint] = useState<InterstitialHint>(null);
 
+  // Playables lifecycle: whether YouTube currently considers us backgrounded,
+  // and whether *YouTube* (not the player) triggered the current pause.
+  const ytPausedRef = useRef(false);
+  const ytAutoPausedRef = useRef(false);
+
   // ---------- Hidden debug overlay ----------
   // Toggle with backtick (`) or by appending ?debug=1 to the URL.
   const [debugOpen, setDebugOpen] = useState(false);
