@@ -178,9 +178,30 @@ function encodeCloudPayload(stats: AllStats): string {
 // payload queued in localStorage and retry it: on interval, on `online`, and
 // after any subsequent successful save. Only the newest payload is kept —
 // intermediate stats are strictly older and safe to drop.
+//
+// Retries use exponential backoff with full jitter so a rate-limited or
+// offline device doesn't hammer saveData, and give up after MAX_SAVE_ATTEMPTS
+// so a permanently-bad payload can't retry forever.
 const CLOUD_QUEUE_KEY = "ppr:cloudq:v1";
+const SAVE_BASE_DELAY_MS = 2_000;
+const SAVE_MAX_DELAY_MS = 120_000;
+export const MAX_SAVE_ATTEMPTS = 8;
 
-type QueuedSave = { payload: string; queuedAt: number; attempts: number };
+/** Full-jitter exponential backoff: random in [base, base * 2^attempt]. */
+function backoffDelay(attempts: number): number {
+  const ceiling = Math.min(SAVE_MAX_DELAY_MS, SAVE_BASE_DELAY_MS * 2 ** Math.max(0, attempts - 1));
+  return Math.round(SAVE_BASE_DELAY_MS + Math.random() * Math.max(0, ceiling - SAVE_BASE_DELAY_MS));
+}
+
+type QueuedSave = {
+  payload: string;
+  queuedAt: number;
+  attempts: number;
+  /** Epoch ms before which no retry should be attempted. */
+  nextAttemptAt: number;
+  /** True once we've exhausted MAX_SAVE_ATTEMPTS. */
+  abandoned?: boolean;
+};
 
 function readQueue(): QueuedSave | null {
   if (typeof window === "undefined") return null;
@@ -189,6 +210,8 @@ function readQueue(): QueuedSave | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as QueuedSave;
     if (!parsed || typeof parsed.payload !== "string") return null;
+    if (typeof parsed.nextAttemptAt !== "number") parsed.nextAttemptAt = 0;
+    if (typeof parsed.attempts !== "number") parsed.attempts = 0;
     return parsed;
   } catch {
     return null;
