@@ -531,6 +531,8 @@ class ChiptuneEngine {
 // ---------- Component ----------
 export default function PixelPulseRush() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  /** The focusable play surface — keeps keyboard focus inside the game. */
+  const playSurfaceRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<ChiptuneEngine | null>(null);
   const notesRef = useRef<Note[]>([]);
   const noteIdRef = useRef(0);
