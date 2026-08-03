@@ -891,19 +891,54 @@ export default function PixelPulseRush() {
         }
       }
     });
+    // YouTube-driven pause/resume must map exactly onto our game + audio state.
+    // We only auto-resume gameplay if *YouTube* was the one that paused it —
+    // a user-initiated pause must stay paused when the tab comes back.
     const offPause = ytg.onPause(() => {
+      ytPausedRef.current = true;
+      // Always silence audio, whatever screen we're on.
+      const eng = engineRef.current;
+      if (eng) {
+        try {
+          eng.master.gain.value = 0;
+        } catch {
+          /* ignore */
+        }
+      }
       if (stateRef.current === "playing") {
+        ytAutoPausedRef.current = true;
         stateRef.current = "paused";
         setState("paused");
-        engineRef.current?.pause();
+        eng?.pause();
+      } else {
+        eng?.pause();
       }
     });
     const offResume = ytg.onResume(() => {
-      if (stateRef.current === "paused") {
-        void engineRef.current?.unpause().then(() => {
+      ytPausedRef.current = false;
+      const eng = engineRef.current;
+      const restoreGain = () => {
+        if (!eng) return;
+        try {
+          eng.master.gain.value = mutedRef.current ? 0 : 0.35;
+        } catch {
+          /* ignore */
+        }
+      };
+      if (ytAutoPausedRef.current && stateRef.current === "paused") {
+        ytAutoPausedRef.current = false;
+        void eng?.unpause().then(() => {
+          restoreGain();
           stateRef.current = "playing";
           setState("playing");
         });
+        return;
+      }
+      // Not mid-run: just bring the audio graph back online for menus/SFX.
+      if (stateRef.current !== "paused") {
+        void eng?.unpause().then(restoreGain);
+      } else {
+        restoreGain();
       }
     });
 
