@@ -107,6 +107,29 @@ function coerceAllStats(x: unknown): AllStats {
 
 type InterstitialHint = "cooldown" | "unavailable" | "shown" | null;
 
+export type SaveRetryState = {
+  state: "idle" | "pending" | "backoff" | "abandoned";
+  attempts: number;
+  maxAttempts: number;
+  /** Epoch ms of the next eligible retry, or null when idle/abandoned. */
+  nextAttemptAt: number | null;
+};
+
+export type DebugLogEntry = {
+  at: number;
+  source: "window.onerror" | "unhandledrejection" | "console.error" | "network" | "sdk";
+  message: string;
+};
+
+/** Best-effort stringify for arbitrary thrown/logged values. */
+function safeStringify(v: unknown): string {
+  try {
+    return typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
+  } catch {
+    return Object.prototype.toString.call(v);
+  }
+}
+
 type DebugInfo = {
   cloudSchemaVersion: number;
   cloudSourceVersion: number | null;
@@ -116,7 +139,9 @@ type DebugInfo = {
   lastSave: { ok: boolean; note: string; at: number } | null;
   saveQueueDepth: number;
   saveQueueAttempts: number;
+  saveRetry: SaveRetryState;
   lastError: string | null;
+  errorLog: DebugLogEntry[];
 };
 
 type MigrationStatus =
@@ -178,9 +203,30 @@ function encodeCloudPayload(stats: AllStats): string {
 // payload queued in localStorage and retry it: on interval, on `online`, and
 // after any subsequent successful save. Only the newest payload is kept —
 // intermediate stats are strictly older and safe to drop.
+//
+// Retries use exponential backoff with full jitter so a rate-limited or
+// offline device doesn't hammer saveData, and give up after MAX_SAVE_ATTEMPTS
+// so a permanently-bad payload can't retry forever.
 const CLOUD_QUEUE_KEY = "ppr:cloudq:v1";
+const SAVE_BASE_DELAY_MS = 2_000;
+const SAVE_MAX_DELAY_MS = 120_000;
+export const MAX_SAVE_ATTEMPTS = 8;
 
-type QueuedSave = { payload: string; queuedAt: number; attempts: number };
+/** Full-jitter exponential backoff: random in [base, base * 2^attempt]. */
+function backoffDelay(attempts: number): number {
+  const ceiling = Math.min(SAVE_MAX_DELAY_MS, SAVE_BASE_DELAY_MS * 2 ** Math.max(0, attempts - 1));
+  return Math.round(SAVE_BASE_DELAY_MS + Math.random() * Math.max(0, ceiling - SAVE_BASE_DELAY_MS));
+}
+
+type QueuedSave = {
+  payload: string;
+  queuedAt: number;
+  attempts: number;
+  /** Epoch ms before which no retry should be attempted. */
+  nextAttemptAt: number;
+  /** True once we've exhausted MAX_SAVE_ATTEMPTS. */
+  abandoned?: boolean;
+};
 
 function readQueue(): QueuedSave | null {
   if (typeof window === "undefined") return null;
@@ -189,6 +235,8 @@ function readQueue(): QueuedSave | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as QueuedSave;
     if (!parsed || typeof parsed.payload !== "string") return null;
+    if (typeof parsed.nextAttemptAt !== "number") parsed.nextAttemptAt = 0;
+    if (typeof parsed.attempts !== "number") parsed.attempts = 0;
     return parsed;
   } catch {
     return null;
@@ -483,6 +531,8 @@ class ChiptuneEngine {
 // ---------- Component ----------
 export default function PixelPulseRush() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  /** The focusable play surface — keeps keyboard focus inside the game. */
+  const playSurfaceRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<ChiptuneEngine | null>(null);
   const notesRef = useRef<Note[]>([]);
   const noteIdRef = useRef(0);
@@ -531,6 +581,11 @@ export default function PixelPulseRush() {
   //  - null         : nothing to say
   const [interstitialHint, setInterstitialHint] = useState<InterstitialHint>(null);
 
+  // Playables lifecycle: whether YouTube currently considers us backgrounded,
+  // and whether *YouTube* (not the player) triggered the current pause.
+  const ytPausedRef = useRef(false);
+  const ytAutoPausedRef = useRef(false);
+
   // ---------- Hidden debug overlay ----------
   // Toggle with backtick (`) or by appending ?debug=1 to the URL.
   const [debugOpen, setDebugOpen] = useState(false);
@@ -543,67 +598,184 @@ export default function PixelPulseRush() {
     lastSave: null,
     saveQueueDepth: 0,
     saveQueueAttempts: 0,
+    saveRetry: { state: "idle", attempts: 0, maxAttempts: MAX_SAVE_ATTEMPTS, nextAttemptAt: null },
     lastError: null,
+    errorLog: [],
   }));
   const patchDebug = useCallback((p: Partial<DebugInfo>) => {
     setDebug((d) => ({ ...d, ...p }));
   }, []);
+
+  /** Append an entry to the debug error log (newest first, capped at 12). */
+  const logDebugError = useCallback((source: DebugLogEntry["source"], message: string) => {
+    const entry: DebugLogEntry = { at: Date.now(), source, message: message.slice(0, 300) };
+    setDebug((d) => ({ ...d, lastError: entry.message, errorLog: [entry, ...d.errorLog].slice(0, 12) }));
+  }, []);
+
+  // ---------- Global error capture ----------
+  // Certification runs flag uncaught errors and unhandled rejections. We record
+  // them (plus console.error and failed fetches) into the debug overlay and
+  // forward them to ytgame.health.logError so YouTube sees the signal too.
+  useEffect(() => {
+    const describe = (v: unknown) =>
+      v instanceof Error ? `${v.name}: ${v.message}` : typeof v === "string" ? v : safeStringify(v);
+
+    const onError = (ev: ErrorEvent) => {
+      const where = ev.filename ? ` (${ev.filename}:${ev.lineno}:${ev.colno})` : "";
+      logDebugError("window.onerror", `${describe(ev.error ?? ev.message)}${where}`);
+      ytg.logError();
+    };
+    const onRejection = (ev: PromiseRejectionEvent) => {
+      logDebugError("unhandledrejection", describe(ev.reason));
+      ytg.logError();
+    };
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+
+    // Mirror console.error without swallowing it.
+    const originalConsoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      try {
+        logDebugError("console.error", args.map(describe).join(" "));
+      } catch {
+        /* never let logging break logging */
+      }
+      originalConsoleError.apply(console, args as never[]);
+    };
+
+    // Record network failures (offline, CORS, 5xx) surfaced through fetch.
+    const originalFetch = window.fetch?.bind(window);
+    if (originalFetch) {
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        try {
+          const res = await originalFetch(input, init);
+          if (!res.ok && res.status >= 500) {
+            logDebugError("network", `${res.status} ${res.statusText} · ${String(res.url || input)}`);
+          }
+          return res;
+        } catch (err) {
+          logDebugError("network", `fetch failed · ${String(input)} · ${describe(err)}`);
+          throw err;
+        }
+      };
+    }
+
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+      console.error = originalConsoleError;
+      if (originalFetch) window.fetch = originalFetch;
+    };
+  }, [logDebugError]);
+
   // ---------- Queued cloud save with retry ----------
   // Only the newest payload is kept; older stats are strictly obsolete once
   // a more recent snapshot exists locally. flushCloudQueue is called from
   // queueCloudSave, from an interval, from `online`, and from tab visibility.
+  // Failures back off exponentially with full jitter and stop after
+  // MAX_SAVE_ATTEMPTS (queue marked `abandoned`, surfaced in the UI hint).
   const flushingRef = useRef(false);
-  const flushCloudQueue = useCallback(async () => {
-    if (flushingRef.current) return;
-    const q = readQueue();
-    if (!q) return;
-    flushingRef.current = true;
-    const res = await ytg.saveCloudDataStrict(q.payload);
-    flushingRef.current = false;
-    if (res.ok) {
-      writeQueue(null);
+
+  const publishRetryState = useCallback(
+    (q: QueuedSave | null) => {
+      if (!q) {
+        patchDebug({
+          saveQueueDepth: 0,
+          saveQueueAttempts: 0,
+          saveRetry: { state: "idle", attempts: 0, maxAttempts: MAX_SAVE_ATTEMPTS, nextAttemptAt: null },
+        });
+        return;
+      }
       patchDebug({
-        lastSave: {
-          ok: true,
-          note: res.noop ? "noop (outside Playables)" : "flushed",
-          at: Date.now(),
+        saveQueueDepth: 1,
+        saveQueueAttempts: q.attempts,
+        saveRetry: {
+          state: q.abandoned ? "abandoned" : q.attempts > 0 ? "backoff" : "pending",
+          attempts: q.attempts,
+          maxAttempts: MAX_SAVE_ATTEMPTS,
+          nextAttemptAt: q.abandoned ? null : q.nextAttemptAt,
         },
-        saveQueueDepth: 0,
       });
-    } else {
-      const bumped: QueuedSave = { ...q, attempts: q.attempts + 1 };
+    },
+    [patchDebug],
+  );
+
+  const flushCloudQueue = useCallback(
+    async (opts?: { force?: boolean }) => {
+      if (flushingRef.current) return;
+      const q = readQueue();
+      if (!q) return;
+      if (q.abandoned && !opts?.force) return;
+      if (!opts?.force && Date.now() < q.nextAttemptAt) {
+        publishRetryState(q);
+        return;
+      }
+      flushingRef.current = true;
+      const res = await ytg.saveCloudDataStrict(q.payload);
+      flushingRef.current = false;
+      if (res.ok) {
+        writeQueue(null);
+        patchDebug({
+          lastSave: {
+            ok: true,
+            note: res.noop ? "noop (outside Playables)" : "flushed",
+            at: Date.now(),
+          },
+        });
+        publishRetryState(null);
+        return;
+      }
+      const attempts = q.attempts + 1;
+      const abandoned = attempts >= MAX_SAVE_ATTEMPTS;
+      const delay = backoffDelay(attempts);
+      const bumped: QueuedSave = {
+        ...q,
+        attempts,
+        abandoned,
+        nextAttemptAt: abandoned ? 0 : Date.now() + delay,
+      };
       writeQueue(bumped);
       patchDebug({
-        lastSave: { ok: false, note: `retry ${bumped.attempts}: ${res.error ?? "err"}`, at: Date.now() },
-        saveQueueDepth: 1,
-        saveQueueAttempts: bumped.attempts,
+        lastSave: {
+          ok: false,
+          note: abandoned
+            ? `gave up after ${attempts} attempts: ${res.error ?? "err"}`
+            : `retry ${attempts}/${MAX_SAVE_ATTEMPTS} in ${Math.round(delay / 1000)}s: ${res.error ?? "err"}`,
+          at: Date.now(),
+        },
         lastError: res.error ?? "save failed",
       });
-    }
-  }, [patchDebug]);
+      publishRetryState(bumped);
+      if (!res.noop) ytg.logError();
+    },
+    [patchDebug, publishRetryState],
+  );
 
   const queueCloudSave = useCallback(
     async (payload: string) => {
-      // Newest wins — overwrite any queued payload with fresher stats.
-      writeQueue({ payload, queuedAt: Date.now(), attempts: 0 });
-      patchDebug({ saveQueueDepth: 1 });
-      await flushCloudQueue();
+      // Newest wins — overwrite any queued payload with fresher stats and
+      // reset the backoff, since this is a brand new save attempt.
+      const q: QueuedSave = { payload, queuedAt: Date.now(), attempts: 0, nextAttemptAt: 0 };
+      writeQueue(q);
+      publishRetryState(q);
+      await flushCloudQueue({ force: true });
     },
-    [flushCloudQueue, patchDebug],
+    [flushCloudQueue, publishRetryState],
   );
 
   // Retry loop for queued saves: interval + network + visibility triggers.
   useEffect(() => {
-    // Adopt any queue from a previous session.
+    // Adopt any queue from a previous session (backoff clock restarts fresh).
     const existing = readQueue();
     if (existing) {
-      patchDebug({ saveQueueDepth: 1, saveQueueAttempts: existing.attempts });
+      publishRetryState(existing);
       void flushCloudQueue();
     }
     const t = window.setInterval(() => {
       void flushCloudQueue();
-    }, 15_000);
-    const onOnline = () => void flushCloudQueue();
+    }, 5_000);
+    // A regained connection is a strong signal — bypass the backoff timer once.
+    const onOnline = () => void flushCloudQueue({ force: true });
     const onVis = () => {
       if (!document.hidden) void flushCloudQueue();
     };
@@ -614,7 +786,7 @@ export default function PixelPulseRush() {
       window.removeEventListener("online", onOnline);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [flushCloudQueue, patchDebug]);
+  }, [flushCloudQueue, publishRetryState]);
 
   // Debug overlay toggle: backtick key or ?debug=1 URL flag.
   useEffect(() => {
@@ -726,19 +898,54 @@ export default function PixelPulseRush() {
         }
       }
     });
+    // YouTube-driven pause/resume must map exactly onto our game + audio state.
+    // We only auto-resume gameplay if *YouTube* was the one that paused it —
+    // a user-initiated pause must stay paused when the tab comes back.
     const offPause = ytg.onPause(() => {
+      ytPausedRef.current = true;
+      // Always silence audio, whatever screen we're on.
+      const eng = engineRef.current;
+      if (eng) {
+        try {
+          eng.master.gain.value = 0;
+        } catch {
+          /* ignore */
+        }
+      }
       if (stateRef.current === "playing") {
+        ytAutoPausedRef.current = true;
         stateRef.current = "paused";
         setState("paused");
-        engineRef.current?.pause();
+        eng?.pause();
+      } else {
+        eng?.pause();
       }
     });
     const offResume = ytg.onResume(() => {
-      if (stateRef.current === "paused") {
-        void engineRef.current?.unpause().then(() => {
+      ytPausedRef.current = false;
+      const eng = engineRef.current;
+      const restoreGain = () => {
+        if (!eng) return;
+        try {
+          eng.master.gain.value = mutedRef.current ? 0 : 0.35;
+        } catch {
+          /* ignore */
+        }
+      };
+      if (ytAutoPausedRef.current && stateRef.current === "paused") {
+        ytAutoPausedRef.current = false;
+        void eng?.unpause().then(() => {
+          restoreGain();
           stateRef.current = "playing";
           setState("playing");
         });
+        return;
+      }
+      // Not mid-run: just bring the audio graph back online for menus/SFX.
+      if (stateRef.current !== "paused") {
+        void eng?.unpause().then(restoreGain);
+      } else {
+        restoreGain();
       }
     });
 
@@ -1024,15 +1231,36 @@ export default function PixelPulseRush() {
 
     let raf = 0;
 
-    const resize = () => {
-      const dpr = window.devicePixelRatio || 1;
+    // Resize handling: coalesce every source (window resize, orientation
+    // change, visualViewport changes from the YouTube chrome / mobile URL bar,
+    // and element-level layout changes) into a single rAF-debounced pass, and
+    // skip no-op resizes so the canvas isn't cleared on every scroll tick.
+    let resizeRaf = 0;
+    const applyResize = () => {
+      resizeRaf = 0;
+      const dpr = Math.min(window.devicePixelRatio || 1, 3);
       const rect = canvas.getBoundingClientRect();
-      canvas.width = Math.floor(rect.width * dpr);
-      canvas.height = Math.floor(rect.height * dpr);
+      const w = Math.max(1, Math.floor(rect.width * dpr));
+      const h = Math.max(1, Math.floor(rect.height * dpr));
+      if (canvas.width === w && canvas.height === h) return;
+      canvas.width = w;
+      canvas.height = h;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
-    resize();
+    const resize = () => {
+      if (resizeRaf) return;
+      resizeRaf = requestAnimationFrame(applyResize);
+    };
+    applyResize();
     window.addEventListener("resize", resize);
+    window.addEventListener("orientationchange", resize);
+    const vv = window.visualViewport;
+    vv?.addEventListener("resize", resize);
+    vv?.addEventListener("scroll", resize);
+    const ro =
+      typeof ResizeObserver !== "undefined" ? new ResizeObserver(resize) : null;
+    ro?.observe(canvas);
+
 
     const freqData = new Uint8Array(64);
 
@@ -1183,7 +1411,12 @@ export default function PixelPulseRush() {
     raf = requestAnimationFrame(render);
     return () => {
       cancelAnimationFrame(raf);
+      if (resizeRaf) cancelAnimationFrame(resizeRaf);
       window.removeEventListener("resize", resize);
+      window.removeEventListener("orientationchange", resize);
+      vv?.removeEventListener("resize", resize);
+      vv?.removeEventListener("scroll", resize);
+      ro?.disconnect();
     };
   }, [endGame]);
 
@@ -1195,16 +1428,35 @@ export default function PixelPulseRush() {
     return Math.max(0, Math.min(LANES - 1, lane));
   };
 
+  // ---------- Tap gesture gating ----------
+  // Certification dings games that let the browser synthesise scroll, zoom,
+  // text-selection or double-tap gestures out of gameplay taps. We accept only
+  // primary pointers while actually playing, swallow multi-finger pinches, and
+  // keep focus on the play surface so keyboard input never escapes to chrome.
+  const gestureBlockedRef = useRef(false);
+
   const onZonePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
+    if (stateRef.current !== "playing" || ytPausedRef.current) return;
+    // A second simultaneous contact within the same finger-down means pinch —
+    // still allow genuine two-lane taps, but never treat a pinch as a tap.
+    if (!e.isPrimary && activeTouchesRef.current.size >= 2) return;
+    if (gestureBlockedRef.current) return;
     const lane = laneFromClientX(e.currentTarget, e.clientX);
     if (lane < 0) return;
     activeTouchesRef.current.set(e.pointerId, lane);
-    (e.currentTarget as HTMLDivElement).setPointerCapture?.(e.pointerId);
+    try {
+      (e.currentTarget as HTMLDivElement).setPointerCapture?.(e.pointerId);
+    } catch {
+      /* capture unsupported / pointer already gone */
+    }
+    // Keep keyboard focus on the play surface (focus retention).
+    playSurfaceRef.current?.focus?.({ preventScroll: true });
     tapLane(lane);
   };
   const onZonePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!activeTouchesRef.current.has(e.pointerId)) return;
+    if (stateRef.current !== "playing") return;
     const lane = laneFromClientX(e.currentTarget, e.clientX);
     if (lane < 0) return;
     const prev = activeTouchesRef.current.get(e.pointerId);
@@ -1215,7 +1467,64 @@ export default function PixelPulseRush() {
   };
   const onZonePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     activeTouchesRef.current.delete(e.pointerId);
+    try {
+      (e.currentTarget as HTMLDivElement).releasePointerCapture?.(e.pointerId);
+    } catch {
+      /* already released */
+    }
   };
+
+  // Document-level gesture suppression + focus retention while mounted.
+  useEffect(() => {
+    const surface = playSurfaceRef.current;
+    const stop = (ev: Event) => {
+      if (stateRef.current === "playing") ev.preventDefault();
+    };
+    // iOS Safari pinch-zoom gestures (non-standard but still fired).
+    document.addEventListener("gesturestart", stop as EventListener, { passive: false });
+    document.addEventListener("gesturechange", stop as EventListener, { passive: false });
+    // Double-tap-to-zoom shows up as a dblclick on the surface.
+    surface?.addEventListener("dblclick", stop, { passive: false });
+    surface?.addEventListener("selectstart", stop);
+    // Long-press callout on mobile.
+    surface?.addEventListener("contextmenu", stop);
+    // Multi-touch on the surface should never scroll the page.
+    const onTouchMove = (ev: TouchEvent) => {
+      if (stateRef.current === "playing") ev.preventDefault();
+      if (ev.touches.length > 1) gestureBlockedRef.current = true;
+    };
+    const onTouchEnd = (ev: TouchEvent) => {
+      if (ev.touches.length === 0) gestureBlockedRef.current = false;
+    };
+    surface?.addEventListener("touchmove", onTouchMove, { passive: false });
+    surface?.addEventListener("touchend", onTouchEnd);
+    surface?.addEventListener("touchcancel", onTouchEnd);
+
+    // Focus retention: if focus drifts to browser chrome while playing, pull it
+    // back to the play surface so key handlers keep working.
+    const onBlur = () => {
+      if (stateRef.current !== "playing") return;
+      window.setTimeout(() => {
+        if (document.activeElement === document.body) {
+          playSurfaceRef.current?.focus?.({ preventScroll: true });
+        }
+      }, 0);
+    };
+    window.addEventListener("blur", onBlur);
+    surface?.focus?.({ preventScroll: true });
+
+    return () => {
+      document.removeEventListener("gesturestart", stop as EventListener);
+      document.removeEventListener("gesturechange", stop as EventListener);
+      surface?.removeEventListener("dblclick", stop);
+      surface?.removeEventListener("selectstart", stop);
+      surface?.removeEventListener("contextmenu", stop);
+      surface?.removeEventListener("touchmove", onTouchMove);
+      surface?.removeEventListener("touchend", onTouchEnd);
+      surface?.removeEventListener("touchcancel", onTouchEnd);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
 
   // ---------- Rewarded ad (bonus points on the score card) ----------
   const REWARD_BONUS_POINTS = 500;
@@ -1556,7 +1865,14 @@ export default function PixelPulseRush() {
         </div>
       </header>
 
-      <div className="relative w-full max-w-[560px] aspect-[9/16] rounded-lg overflow-hidden border border-border scanlines shadow-[0_0_60px_-10px_rgba(255,62,165,0.5)]">
+      <div
+        ref={playSurfaceRef}
+        tabIndex={0}
+        role="application"
+        aria-label="Pixel Pulse Rush play surface"
+        style={{ touchAction: "none", WebkitUserSelect: "none", WebkitTouchCallout: "none" }}
+        className="relative w-full max-w-[560px] aspect-[9/16] rounded-lg overflow-hidden border border-border scanlines shadow-[0_0_60px_-10px_rgba(255,62,165,0.5)] outline-none select-none touch-none focus-visible:ring-2 focus-visible:ring-[var(--neon-cyan)]"
+      >
         <canvas
           ref={canvasRef}
           className="w-full h-full block touch-none select-none pointer-events-none"
@@ -1769,7 +2085,7 @@ export default function PixelPulseRush() {
                 QUIT
               </button>
             </div>
-            <AdHint hint={interstitialHint} />
+            <AdHint hint={interstitialHint} retry={debug.saveRetry} />
           </Overlay>
         )}
 
@@ -1944,7 +2260,7 @@ export default function PixelPulseRush() {
                 </a>
               </div>
             )}
-            <AdHint hint={interstitialHint} />
+            <AdHint hint={interstitialHint} retry={debug.saveRetry} />
           </Overlay>
         )}
 
@@ -1971,7 +2287,7 @@ function Overlay({ children }: { children: React.ReactNode }) {
  * Small non-disruptive line explaining ad state on pause/game-over.
  * Always renders (fixed height) so the button layout doesn't shift.
  */
-function AdHint({ hint }: { hint: InterstitialHint }) {
+function AdHint({ hint, retry }: { hint: InterstitialHint; retry?: SaveRetryState }) {
   const text =
     hint === "cooldown"
       ? "ad on cooldown — next break eligible in ~90s"
@@ -1980,9 +2296,26 @@ function AdHint({ hint }: { hint: InterstitialHint }) {
         : hint === "shown"
           ? "ad requested"
           : "";
+  const retryText =
+    !retry || retry.state === "idle"
+      ? ""
+      : retry.state === "abandoned"
+        ? `stats couldn't sync — saved on this device only (${retry.attempts}/${retry.maxAttempts} tries)`
+        : retry.state === "backoff"
+          ? `syncing stats — retry ${retry.attempts}/${retry.maxAttempts}${
+              retry.nextAttemptAt
+                ? ` in ~${Math.max(0, Math.ceil((retry.nextAttemptAt - Date.now()) / 1000))}s`
+                : ""
+            }`
+          : "syncing stats…";
   return (
     <div className="mt-3 min-h-[14px] text-[9px] font-mono tracking-wide text-white/50">
-      {text}
+      <div>{text}</div>
+      {retryText && (
+        <div className={retry?.state === "abandoned" ? "text-glow-pink" : "text-white/45"}>
+          {retryText}
+        </div>
+      )}
     </div>
   );
 }
@@ -2056,8 +2389,39 @@ function DebugOverlay({
         <div>
           queue: {info.saveQueueDepth} · attempts: {info.saveQueueAttempts}
         </div>
+        <div>
+          retry:{" "}
+          <span
+            className={
+              info.saveRetry.state === "abandoned"
+                ? "text-glow-pink"
+                : info.saveRetry.state === "idle"
+                  ? "text-white/50"
+                  : "text-glow-yellow"
+            }
+          >
+            {info.saveRetry.state}
+          </span>{" "}
+          {info.saveRetry.attempts}/{info.saveRetry.maxAttempts}
+          {info.saveRetry.nextAttemptAt ? ` · next ${fmt(info.saveRetry.nextAttemptAt)}` : ""}
+        </div>
         <div className="mt-1 border-t border-white/10 pt-1 text-glow-pink break-words">
           err: {info.lastError ?? "—"}
+        </div>
+        <div className="mt-1 border-t border-white/10 pt-1">
+          <div className="text-white/50">errors ({info.errorLog.length})</div>
+          <div className="max-h-32 overflow-y-auto">
+            {info.errorLog.length === 0 ? (
+              <div className="text-white/40">—</div>
+            ) : (
+              info.errorLog.map((e, i) => (
+                <div key={`${e.at}-${i}`} className="break-words text-white/70">
+                  <span className="text-glow-cyan">{fmt(e.at)}</span>{" "}
+                  <span className="text-glow-yellow">{e.source}</span> {e.message}
+                </div>
+              ))
+            )}
+          </div>
         </div>
         <div className="mt-1 text-[9px] text-white/40">` toggles · ?debug=1</div>
       </div>
