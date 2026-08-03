@@ -2287,7 +2287,7 @@ function Overlay({ children }: { children: React.ReactNode }) {
  * Small non-disruptive line explaining ad state on pause/game-over.
  * Always renders (fixed height) so the button layout doesn't shift.
  */
-function AdHint({ hint }: { hint: InterstitialHint }) {
+function AdHint({ hint, retry }: { hint: InterstitialHint; retry?: SaveRetryState }) {
   const text =
     hint === "cooldown"
       ? "ad on cooldown — next break eligible in ~90s"
@@ -2296,9 +2296,26 @@ function AdHint({ hint }: { hint: InterstitialHint }) {
         : hint === "shown"
           ? "ad requested"
           : "";
+  const retryText =
+    !retry || retry.state === "idle"
+      ? ""
+      : retry.state === "abandoned"
+        ? `stats couldn't sync — saved on this device only (${retry.attempts}/${retry.maxAttempts} tries)`
+        : retry.state === "backoff"
+          ? `syncing stats — retry ${retry.attempts}/${retry.maxAttempts}${
+              retry.nextAttemptAt
+                ? ` in ~${Math.max(0, Math.ceil((retry.nextAttemptAt - Date.now()) / 1000))}s`
+                : ""
+            }`
+          : "syncing stats…";
   return (
     <div className="mt-3 min-h-[14px] text-[9px] font-mono tracking-wide text-white/50">
-      {text}
+      <div>{text}</div>
+      {retryText && (
+        <div className={retry?.state === "abandoned" ? "text-glow-pink" : "text-white/45"}>
+          {retryText}
+        </div>
+      )}
     </div>
   );
 }
