@@ -2389,8 +2389,39 @@ function DebugOverlay({
         <div>
           queue: {info.saveQueueDepth} · attempts: {info.saveQueueAttempts}
         </div>
+        <div>
+          retry:{" "}
+          <span
+            className={
+              info.saveRetry.state === "abandoned"
+                ? "text-glow-pink"
+                : info.saveRetry.state === "idle"
+                  ? "text-white/50"
+                  : "text-glow-yellow"
+            }
+          >
+            {info.saveRetry.state}
+          </span>{" "}
+          {info.saveRetry.attempts}/{info.saveRetry.maxAttempts}
+          {info.saveRetry.nextAttemptAt ? ` · next ${fmt(info.saveRetry.nextAttemptAt)}` : ""}
+        </div>
         <div className="mt-1 border-t border-white/10 pt-1 text-glow-pink break-words">
           err: {info.lastError ?? "—"}
+        </div>
+        <div className="mt-1 border-t border-white/10 pt-1">
+          <div className="text-white/50">errors ({info.errorLog.length})</div>
+          <div className="max-h-32 overflow-y-auto">
+            {info.errorLog.length === 0 ? (
+              <div className="text-white/40">—</div>
+            ) : (
+              info.errorLog.map((e, i) => (
+                <div key={`${e.at}-${i}`} className="break-words text-white/70">
+                  <span className="text-glow-cyan">{fmt(e.at)}</span>{" "}
+                  <span className="text-glow-yellow">{e.source}</span> {e.message}
+                </div>
+              ))
+            )}
+          </div>
         </div>
         <div className="mt-1 text-[9px] text-white/40">` toggles · ?debug=1</div>
       </div>
