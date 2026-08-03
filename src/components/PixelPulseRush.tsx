@@ -107,6 +107,20 @@ function coerceAllStats(x: unknown): AllStats {
 
 type InterstitialHint = "cooldown" | "unavailable" | "shown" | null;
 
+export type SaveRetryState = {
+  state: "idle" | "pending" | "backoff" | "abandoned";
+  attempts: number;
+  maxAttempts: number;
+  /** Epoch ms of the next eligible retry, or null when idle/abandoned. */
+  nextAttemptAt: number | null;
+};
+
+export type DebugLogEntry = {
+  at: number;
+  source: "window.onerror" | "unhandledrejection" | "console.error" | "network" | "sdk";
+  message: string;
+};
+
 type DebugInfo = {
   cloudSchemaVersion: number;
   cloudSourceVersion: number | null;
@@ -116,7 +130,9 @@ type DebugInfo = {
   lastSave: { ok: boolean; note: string; at: number } | null;
   saveQueueDepth: number;
   saveQueueAttempts: number;
+  saveRetry: SaveRetryState;
   lastError: string | null;
+  errorLog: DebugLogEntry[];
 };
 
 type MigrationStatus =
