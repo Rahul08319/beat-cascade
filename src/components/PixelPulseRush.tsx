@@ -1865,7 +1865,14 @@ export default function PixelPulseRush() {
         </div>
       </header>
 
-      <div className="relative w-full max-w-[560px] aspect-[9/16] rounded-lg overflow-hidden border border-border scanlines shadow-[0_0_60px_-10px_rgba(255,62,165,0.5)]">
+      <div
+        ref={playSurfaceRef}
+        tabIndex={0}
+        role="application"
+        aria-label="Pixel Pulse Rush play surface"
+        style={{ touchAction: "none", WebkitUserSelect: "none", WebkitTouchCallout: "none" }}
+        className="relative w-full max-w-[560px] aspect-[9/16] rounded-lg overflow-hidden border border-border scanlines shadow-[0_0_60px_-10px_rgba(255,62,165,0.5)] outline-none select-none touch-none focus-visible:ring-2 focus-visible:ring-[var(--neon-cyan)]"
+      >
         <canvas
           ref={canvasRef}
           className="w-full h-full block touch-none select-none pointer-events-none"
