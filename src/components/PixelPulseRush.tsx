@@ -575,58 +575,110 @@ export default function PixelPulseRush() {
   // Only the newest payload is kept; older stats are strictly obsolete once
   // a more recent snapshot exists locally. flushCloudQueue is called from
   // queueCloudSave, from an interval, from `online`, and from tab visibility.
+  // Failures back off exponentially with full jitter and stop after
+  // MAX_SAVE_ATTEMPTS (queue marked `abandoned`, surfaced in the UI hint).
   const flushingRef = useRef(false);
-  const flushCloudQueue = useCallback(async () => {
-    if (flushingRef.current) return;
-    const q = readQueue();
-    if (!q) return;
-    flushingRef.current = true;
-    const res = await ytg.saveCloudDataStrict(q.payload);
-    flushingRef.current = false;
-    if (res.ok) {
-      writeQueue(null);
+
+  const publishRetryState = useCallback(
+    (q: QueuedSave | null) => {
+      if (!q) {
+        patchDebug({
+          saveQueueDepth: 0,
+          saveQueueAttempts: 0,
+          saveRetry: { state: "idle", attempts: 0, maxAttempts: MAX_SAVE_ATTEMPTS, nextAttemptAt: null },
+        });
+        return;
+      }
       patchDebug({
-        lastSave: {
-          ok: true,
-          note: res.noop ? "noop (outside Playables)" : "flushed",
-          at: Date.now(),
+        saveQueueDepth: 1,
+        saveQueueAttempts: q.attempts,
+        saveRetry: {
+          state: q.abandoned ? "abandoned" : q.attempts > 0 ? "backoff" : "pending",
+          attempts: q.attempts,
+          maxAttempts: MAX_SAVE_ATTEMPTS,
+          nextAttemptAt: q.abandoned ? null : q.nextAttemptAt,
         },
-        saveQueueDepth: 0,
       });
-    } else {
-      const bumped: QueuedSave = { ...q, attempts: q.attempts + 1 };
+    },
+    [patchDebug],
+  );
+
+  const flushCloudQueue = useCallback(
+    async (opts?: { force?: boolean }) => {
+      if (flushingRef.current) return;
+      const q = readQueue();
+      if (!q) return;
+      if (q.abandoned && !opts?.force) return;
+      if (!opts?.force && Date.now() < q.nextAttemptAt) {
+        publishRetryState(q);
+        return;
+      }
+      flushingRef.current = true;
+      const res = await ytg.saveCloudDataStrict(q.payload);
+      flushingRef.current = false;
+      if (res.ok) {
+        writeQueue(null);
+        patchDebug({
+          lastSave: {
+            ok: true,
+            note: res.noop ? "noop (outside Playables)" : "flushed",
+            at: Date.now(),
+          },
+        });
+        publishRetryState(null);
+        return;
+      }
+      const attempts = q.attempts + 1;
+      const abandoned = attempts >= MAX_SAVE_ATTEMPTS;
+      const delay = backoffDelay(attempts);
+      const bumped: QueuedSave = {
+        ...q,
+        attempts,
+        abandoned,
+        nextAttemptAt: abandoned ? 0 : Date.now() + delay,
+      };
       writeQueue(bumped);
       patchDebug({
-        lastSave: { ok: false, note: `retry ${bumped.attempts}: ${res.error ?? "err"}`, at: Date.now() },
-        saveQueueDepth: 1,
-        saveQueueAttempts: bumped.attempts,
+        lastSave: {
+          ok: false,
+          note: abandoned
+            ? `gave up after ${attempts} attempts: ${res.error ?? "err"}`
+            : `retry ${attempts}/${MAX_SAVE_ATTEMPTS} in ${Math.round(delay / 1000)}s: ${res.error ?? "err"}`,
+          at: Date.now(),
+        },
         lastError: res.error ?? "save failed",
       });
-    }
-  }, [patchDebug]);
+      publishRetryState(bumped);
+      if (!res.noop) ytg.logError();
+    },
+    [patchDebug, publishRetryState],
+  );
 
   const queueCloudSave = useCallback(
     async (payload: string) => {
-      // Newest wins — overwrite any queued payload with fresher stats.
-      writeQueue({ payload, queuedAt: Date.now(), attempts: 0 });
-      patchDebug({ saveQueueDepth: 1 });
-      await flushCloudQueue();
+      // Newest wins — overwrite any queued payload with fresher stats and
+      // reset the backoff, since this is a brand new save attempt.
+      const q: QueuedSave = { payload, queuedAt: Date.now(), attempts: 0, nextAttemptAt: 0 };
+      writeQueue(q);
+      publishRetryState(q);
+      await flushCloudQueue({ force: true });
     },
-    [flushCloudQueue, patchDebug],
+    [flushCloudQueue, publishRetryState],
   );
 
   // Retry loop for queued saves: interval + network + visibility triggers.
   useEffect(() => {
-    // Adopt any queue from a previous session.
+    // Adopt any queue from a previous session (backoff clock restarts fresh).
     const existing = readQueue();
     if (existing) {
-      patchDebug({ saveQueueDepth: 1, saveQueueAttempts: existing.attempts });
+      publishRetryState(existing);
       void flushCloudQueue();
     }
     const t = window.setInterval(() => {
       void flushCloudQueue();
-    }, 15_000);
-    const onOnline = () => void flushCloudQueue();
+    }, 5_000);
+    // A regained connection is a strong signal — bypass the backoff timer once.
+    const onOnline = () => void flushCloudQueue({ force: true });
     const onVis = () => {
       if (!document.hidden) void flushCloudQueue();
     };
@@ -637,7 +689,7 @@ export default function PixelPulseRush() {
       window.removeEventListener("online", onOnline);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [flushCloudQueue, patchDebug]);
+  }, [flushCloudQueue, publishRetryState]);
 
   // Debug overlay toggle: backtick key or ?debug=1 URL flag.
   useEffect(() => {
