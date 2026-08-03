@@ -1409,7 +1409,12 @@ export default function PixelPulseRush() {
     raf = requestAnimationFrame(render);
     return () => {
       cancelAnimationFrame(raf);
+      if (resizeRaf) cancelAnimationFrame(resizeRaf);
       window.removeEventListener("resize", resize);
+      window.removeEventListener("orientationchange", resize);
+      vv?.removeEventListener("resize", resize);
+      vv?.removeEventListener("scroll", resize);
+      ro?.disconnect();
     };
   }, [endGame]);
 
@@ -1421,16 +1426,35 @@ export default function PixelPulseRush() {
     return Math.max(0, Math.min(LANES - 1, lane));
   };
 
+  // ---------- Tap gesture gating ----------
+  // Certification dings games that let the browser synthesise scroll, zoom,
+  // text-selection or double-tap gestures out of gameplay taps. We accept only
+  // primary pointers while actually playing, swallow multi-finger pinches, and
+  // keep focus on the play surface so keyboard input never escapes to chrome.
+  const gestureBlockedRef = useRef(false);
+
   const onZonePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
+    if (stateRef.current !== "playing" || ytPausedRef.current) return;
+    // A second simultaneous contact within the same finger-down means pinch —
+    // still allow genuine two-lane taps, but never treat a pinch as a tap.
+    if (!e.isPrimary && activeTouchesRef.current.size >= 2) return;
+    if (gestureBlockedRef.current) return;
     const lane = laneFromClientX(e.currentTarget, e.clientX);
     if (lane < 0) return;
     activeTouchesRef.current.set(e.pointerId, lane);
-    (e.currentTarget as HTMLDivElement).setPointerCapture?.(e.pointerId);
+    try {
+      (e.currentTarget as HTMLDivElement).setPointerCapture?.(e.pointerId);
+    } catch {
+      /* capture unsupported / pointer already gone */
+    }
+    // Keep keyboard focus on the play surface (focus retention).
+    playSurfaceRef.current?.focus?.({ preventScroll: true });
     tapLane(lane);
   };
   const onZonePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!activeTouchesRef.current.has(e.pointerId)) return;
+    if (stateRef.current !== "playing") return;
     const lane = laneFromClientX(e.currentTarget, e.clientX);
     if (lane < 0) return;
     const prev = activeTouchesRef.current.get(e.pointerId);
@@ -1441,7 +1465,64 @@ export default function PixelPulseRush() {
   };
   const onZonePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     activeTouchesRef.current.delete(e.pointerId);
+    try {
+      (e.currentTarget as HTMLDivElement).releasePointerCapture?.(e.pointerId);
+    } catch {
+      /* already released */
+    }
   };
+
+  // Document-level gesture suppression + focus retention while mounted.
+  useEffect(() => {
+    const surface = playSurfaceRef.current;
+    const stop = (ev: Event) => {
+      if (stateRef.current === "playing") ev.preventDefault();
+    };
+    // iOS Safari pinch-zoom gestures (non-standard but still fired).
+    document.addEventListener("gesturestart", stop as EventListener, { passive: false });
+    document.addEventListener("gesturechange", stop as EventListener, { passive: false });
+    // Double-tap-to-zoom shows up as a dblclick on the surface.
+    surface?.addEventListener("dblclick", stop, { passive: false });
+    surface?.addEventListener("selectstart", stop);
+    // Long-press callout on mobile.
+    surface?.addEventListener("contextmenu", stop);
+    // Multi-touch on the surface should never scroll the page.
+    const onTouchMove = (ev: TouchEvent) => {
+      if (stateRef.current === "playing") ev.preventDefault();
+      if (ev.touches.length > 1) gestureBlockedRef.current = true;
+    };
+    const onTouchEnd = (ev: TouchEvent) => {
+      if (ev.touches.length === 0) gestureBlockedRef.current = false;
+    };
+    surface?.addEventListener("touchmove", onTouchMove, { passive: false });
+    surface?.addEventListener("touchend", onTouchEnd);
+    surface?.addEventListener("touchcancel", onTouchEnd);
+
+    // Focus retention: if focus drifts to browser chrome while playing, pull it
+    // back to the play surface so key handlers keep working.
+    const onBlur = () => {
+      if (stateRef.current !== "playing") return;
+      window.setTimeout(() => {
+        if (document.activeElement === document.body) {
+          playSurfaceRef.current?.focus?.({ preventScroll: true });
+        }
+      }, 0);
+    };
+    window.addEventListener("blur", onBlur);
+    surface?.focus?.({ preventScroll: true });
+
+    return () => {
+      document.removeEventListener("gesturestart", stop as EventListener);
+      document.removeEventListener("gesturechange", stop as EventListener);
+      surface?.removeEventListener("dblclick", stop);
+      surface?.removeEventListener("selectstart", stop);
+      surface?.removeEventListener("contextmenu", stop);
+      surface?.removeEventListener("touchmove", onTouchMove);
+      surface?.removeEventListener("touchend", onTouchEnd);
+      surface?.removeEventListener("touchcancel", onTouchEnd);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
 
   // ---------- Rewarded ad (bonus points on the score card) ----------
   const REWARD_BONUS_POINTS = 500;
