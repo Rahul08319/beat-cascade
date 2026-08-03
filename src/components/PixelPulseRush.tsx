@@ -2260,7 +2260,7 @@ export default function PixelPulseRush() {
                 </a>
               </div>
             )}
-            <AdHint hint={interstitialHint} />
+            <AdHint hint={interstitialHint} retry={debug.saveRetry} />
           </Overlay>
         )}
 
