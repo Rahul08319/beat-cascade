@@ -121,6 +121,15 @@ export type DebugLogEntry = {
   message: string;
 };
 
+/** Best-effort stringify for arbitrary thrown/logged values. */
+function safeStringify(v: unknown): string {
+  try {
+    return typeof v === "object" && v !== null ? JSON.stringify(v) : String(v);
+  } catch {
+    return Object.prototype.toString.call(v);
+  }
+}
+
 type DebugInfo = {
   cloudSchemaVersion: number;
   cloudSourceVersion: number | null;
