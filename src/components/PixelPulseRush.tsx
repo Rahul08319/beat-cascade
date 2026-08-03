@@ -582,11 +582,76 @@ export default function PixelPulseRush() {
     lastSave: null,
     saveQueueDepth: 0,
     saveQueueAttempts: 0,
+    saveRetry: { state: "idle", attempts: 0, maxAttempts: MAX_SAVE_ATTEMPTS, nextAttemptAt: null },
     lastError: null,
+    errorLog: [],
   }));
   const patchDebug = useCallback((p: Partial<DebugInfo>) => {
     setDebug((d) => ({ ...d, ...p }));
   }, []);
+
+  /** Append an entry to the debug error log (newest first, capped at 12). */
+  const logDebugError = useCallback((source: DebugLogEntry["source"], message: string) => {
+    const entry: DebugLogEntry = { at: Date.now(), source, message: message.slice(0, 300) };
+    setDebug((d) => ({ ...d, lastError: entry.message, errorLog: [entry, ...d.errorLog].slice(0, 12) }));
+  }, []);
+
+  // ---------- Global error capture ----------
+  // Certification runs flag uncaught errors and unhandled rejections. We record
+  // them (plus console.error and failed fetches) into the debug overlay and
+  // forward them to ytgame.health.logError so YouTube sees the signal too.
+  useEffect(() => {
+    const describe = (v: unknown) =>
+      v instanceof Error ? `${v.name}: ${v.message}` : typeof v === "string" ? v : safeStringify(v);
+
+    const onError = (ev: ErrorEvent) => {
+      const where = ev.filename ? ` (${ev.filename}:${ev.lineno}:${ev.colno})` : "";
+      logDebugError("window.onerror", `${describe(ev.error ?? ev.message)}${where}`);
+      ytg.logError();
+    };
+    const onRejection = (ev: PromiseRejectionEvent) => {
+      logDebugError("unhandledrejection", describe(ev.reason));
+      ytg.logError();
+    };
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+
+    // Mirror console.error without swallowing it.
+    const originalConsoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      try {
+        logDebugError("console.error", args.map(describe).join(" "));
+      } catch {
+        /* never let logging break logging */
+      }
+      originalConsoleError.apply(console, args as never[]);
+    };
+
+    // Record network failures (offline, CORS, 5xx) surfaced through fetch.
+    const originalFetch = window.fetch?.bind(window);
+    if (originalFetch) {
+      window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        try {
+          const res = await originalFetch(input, init);
+          if (!res.ok && res.status >= 500) {
+            logDebugError("network", `${res.status} ${res.statusText} · ${String(res.url || input)}`);
+          }
+          return res;
+        } catch (err) {
+          logDebugError("network", `fetch failed · ${String(input)} · ${describe(err)}`);
+          throw err;
+        }
+      };
+    }
+
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+      console.error = originalConsoleError;
+      if (originalFetch) window.fetch = originalFetch;
+    };
+  }, [logDebugError]);
+
   // ---------- Queued cloud save with retry ----------
   // Only the newest payload is kept; older stats are strictly obsolete once
   // a more recent snapshot exists locally. flushCloudQueue is called from
