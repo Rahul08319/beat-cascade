@@ -1229,15 +1229,36 @@ export default function PixelPulseRush() {
 
     let raf = 0;
 
-    const resize = () => {
-      const dpr = window.devicePixelRatio || 1;
+    // Resize handling: coalesce every source (window resize, orientation
+    // change, visualViewport changes from the YouTube chrome / mobile URL bar,
+    // and element-level layout changes) into a single rAF-debounced pass, and
+    // skip no-op resizes so the canvas isn't cleared on every scroll tick.
+    let resizeRaf = 0;
+    const applyResize = () => {
+      resizeRaf = 0;
+      const dpr = Math.min(window.devicePixelRatio || 1, 3);
       const rect = canvas.getBoundingClientRect();
-      canvas.width = Math.floor(rect.width * dpr);
-      canvas.height = Math.floor(rect.height * dpr);
+      const w = Math.max(1, Math.floor(rect.width * dpr));
+      const h = Math.max(1, Math.floor(rect.height * dpr));
+      if (canvas.width === w && canvas.height === h) return;
+      canvas.width = w;
+      canvas.height = h;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
-    resize();
+    const resize = () => {
+      if (resizeRaf) return;
+      resizeRaf = requestAnimationFrame(applyResize);
+    };
+    applyResize();
     window.addEventListener("resize", resize);
+    window.addEventListener("orientationchange", resize);
+    const vv = window.visualViewport;
+    vv?.addEventListener("resize", resize);
+    vv?.addEventListener("scroll", resize);
+    const ro =
+      typeof ResizeObserver !== "undefined" ? new ResizeObserver(resize) : null;
+    ro?.observe(canvas);
+
 
     const freqData = new Uint8Array(64);
 
